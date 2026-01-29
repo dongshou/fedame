@@ -191,60 +191,51 @@ class ExpertPool(nn.Module):
         class_anchors: torch.Tensor,
         temperature: float = 0.1
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: 输入特征 [B, input_dim]
-            expert_ids: 每个样本对应的专家ID [B]
-            class_anchors: 类锚点 [num_classes, anchor_dim]
-            temperature: 温度系数
-        
-        Returns:
-            logits: 分类logits [B, num_classes]
-            expert_features: 专家输出特征 [B, output_dim]
-        """
         batch_size = x.size(0)
         num_classes = class_anchors.size(0)
+        device = x.device
+        num_experts = len(self.experts)
+        expert_id_list = [int(k) for k in self.experts.keys()]
         
-        # 初始化输出
-        all_features = torch.zeros(batch_size, self.output_dim, device=x.device)
-        all_logits = torch.full(
-            (batch_size, num_classes), float('-inf'), device=x.device
-        )
+        class_anchors_norm = F.normalize(class_anchors, p=2, dim=-1)
         
-        # 按专家分组处理
-        unique_experts = torch.unique(expert_ids)
+        all_expert_features = []
+        all_expert_logits = []
         
-        for exp_id in unique_experts:
-            exp_id_int = exp_id.item()
-            mask = (expert_ids == exp_id)
+        for exp_id_str, expert in self.experts.items():
+            expert_feat = expert(x)  # [B, output_dim]
+            all_expert_features.append(expert_feat)
             
-            if not mask.any():
-                continue
+            sim = torch.mm(expert_feat, class_anchors_norm.t()) / temperature
             
-            expert = self.get_expert(exp_id_int)
-            expert_input = x[mask]
-            
-            # 专家处理
-            expert_features = expert(expert_input)
-            all_features[mask] = expert_features
-            
-            # 获取该专家负责的类别
             responsible_classes = expert.responsible_classes
-            
+            mask = torch.zeros(num_classes, device=device)
             if len(responsible_classes) > 0:
-                # 只在负责的类别上计算logits
-                class_indices = torch.tensor(
-                    responsible_classes, device=x.device
-                )
-                relevant_anchors = class_anchors[class_indices]
-                relevant_anchors = F.normalize(relevant_anchors, p=2, dim=-1)
-                
-                # 计算相似度
-                sim = torch.mm(expert_features, relevant_anchors.t()) / temperature
-                
-                # 填充到对应位置
-                for i, cls in enumerate(responsible_classes):
-                    all_logits[mask, cls] = sim[:, i]
+                for cls in responsible_classes:
+                    mask[cls] = 1.0
+            
+            masked_sim = sim + (1 - mask) * (-1e9)
+            all_expert_logits.append(masked_sim)
+        
+        # 堆叠: [E, B, ...]
+        stacked_features = torch.stack(all_expert_features, dim=0)  # [E, B, output_dim]
+        stacked_logits = torch.stack(all_expert_logits, dim=0)      # [E, B, num_classes]
+        
+        # 构建选择索引
+        expert_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
+        for i, eid in enumerate(expert_id_list):
+            expert_idx[expert_ids == eid] = i
+        
+        # 从 [E, B, output_dim] 中选择每个样本对应的专家输出
+        stacked_features = stacked_features.permute(1, 0, 2)  # [B, E, output_dim]
+        stacked_logits = stacked_logits.permute(1, 0, 2)      # [B, E, num_classes]
+        
+        # 用 gather 选择
+        idx_feat = expert_idx.view(batch_size, 1, 1).expand(-1, -1, self.output_dim)  # [B, 1, output_dim]
+        all_features = stacked_features.gather(1, idx_feat).squeeze(1)  # [B, output_dim]
+        
+        idx_logit = expert_idx.view(batch_size, 1, 1).expand(-1, -1, num_classes)  # [B, 1, num_classes]
+        all_logits = stacked_logits.gather(1, idx_logit).squeeze(1)  # [B, num_classes]
         
         return all_logits, all_features
     

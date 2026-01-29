@@ -4,8 +4,9 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from typing import Dict, List, Optional, Tuple
 import copy
 
@@ -97,23 +98,49 @@ class FedAMEClient:
         
         # 更新专家池的映射（确保专家存在）
         for cls, exp in class_to_expert.items():
-            # 如果专家不存在，先创建并移动到正确设备
             if str(exp) not in self.expert_pool.experts:
                 self.expert_pool.add_expert(exp)
                 self.expert_pool.experts[str(exp)].to(self.device)
             self.expert_pool.assign_class_to_expert(cls, exp)
         
-        # 为本地类添加分布
-        for cls in local_classes:
-            if not self.distribution_pool.has_class(cls):
-                self.distribution_pool.add_class(cls)
+        # 注意：分布的初始化移到 init_distributions_from_data
         
-        # 初始化优化器
+    
+    def init_distributions_from_data(self, train_loader: DataLoader):
+        """
+        用真实 backbone 特征均值初始化分布
+        
+        Args:
+            train_loader: 训练数据加载器
+        """
+        self.backbone.eval()
+        
+        # 收集每个类的特征
+        class_features = {cls: [] for cls in self.local_classes}
+        
+        with torch.no_grad():
+            for images, labels in train_loader:
+                images = images.to(self.device)
+                features = self.backbone(images)  # [B, 512]
+                
+                for i, label in enumerate(labels):
+                    cls = label.item()
+                    if cls in class_features:
+                        class_features[cls].append(features[i].cpu())
+        
+        # 计算均值并初始化分布
+        for cls in self.local_classes:
+            if len(class_features[cls]) > 0:
+                feats = torch.stack(class_features[cls], dim=0)  # [N, 512]
+                mean = feats.mean(dim=0).to(self.device)  # [512]
+                
+                self.distribution_pool.add_class(cls, init_mean=mean)
+                self.distribution_pool.get_distribution(cls).update_sample_count(len(feats))
+        # 重新初始化优化器（包含新的分布参数）
         self._init_optimizer()
     
     def _init_optimizer(self):
         """初始化优化器"""
-        # 收集可训练参数
         params = []
         
         # 路由层参数
@@ -142,138 +169,209 @@ class FedAMEClient:
         self.old_router = copy.deepcopy(self.router)
         self.old_expert_pool = copy.deepcopy(self.expert_pool)
         
-        # 冻结旧模型
         for param in self.old_router.parameters():
             param.requires_grad = False
         for param in self.old_expert_pool.parameters():
             param.requires_grad = False
     
-    def train_epoch(
+    def train_router_only(
         self,
         train_loader: DataLoader,
-        old_classes: Optional[List[int]] = None
+        num_pseudo_samples: int = 50,
+        lambda_pseudo: float = 0.2
     ) -> Dict[str, float]:
         """
-        训练一个epoch
-        
-        Args:
-            train_loader: 训练数据加载器
-            old_classes: 旧类别列表（用于防遗忘）
-        
-        Returns:
-            metrics: 训练指标
+        阶段1: 只训练路由器（冻结专家）
         """
         self.router.train()
-        self.expert_pool.train()
+        self.expert_pool.eval()
         
         total_loss = 0.0
-        total_correct = 0
-        total_samples = 0
-        loss_components = {
-            'cls': 0.0, 'route': 0.0, 'contrast': 0.0,
-            'forget': 0.0, 'dist': 0.0
-        }
+        total_routing_correct = 0
+        total_routing_samples = 0
+        
+        loss_components = {'route': 0.0, 'contrast': 0.0, 'pseudo': 0.0}
         
         for batch_idx, (images, labels) in enumerate(train_loader):
             images = images.to(self.device)
             labels = labels.to(self.device)
             
-            self.optimizer.zero_grad()
+            for param in self.expert_pool.parameters():
+                param.requires_grad = False
+            for param in self.router.parameters():
+                param.requires_grad = True
             
-            # 前向传播
-            # 1. Backbone特征提取
             with torch.no_grad():
                 backbone_features = self.backbone(images)
             
-            # 2. 路由
             expert_ids, routing_probs, projected = self.router(backbone_features)
             
-            # 3. 获取目标专家ID（基于标签）
             target_experts = torch.tensor(
                 [self.expert_pool.get_expert_for_class(l.item()) for l in labels],
                 device=self.device
             )
-            
-            # 4. 专家处理
-            cls_logits, expert_features = self.expert_pool(
-                projected, target_experts, self.class_anchors
-            )
-            
-            # 5. 分布采样（可选，用于增强）
-            # ...
-            
-            # 6. 计算防遗忘损失
-            old_logits = None
-            new_logits_for_old = None
-            
-            if old_classes and len(old_classes) > 0 and self.old_router is not None:
-                # 从旧类分布采样
-                old_samples, old_labels = self.distribution_pool.sample_batch(
-                    old_classes, num_samples_per_class=2
-                )
-                
-                if old_samples is not None:
-                    old_samples = old_samples.to(self.device)
-                    
-                    # 旧模型输出
-                    with torch.no_grad():
-                        _, _, old_projected = self.old_router(
-                            old_samples, return_projected=True
-                        )
-                        # 简化：直接使用路由层输出的类logits
-                        old_logits = self.old_router.compute_class_logits(old_projected)
-                    
-                    # 新模型输出
-                    _, _, new_projected = self.router(old_samples, return_projected=True)
-                    new_logits_for_old = self.router.compute_class_logits(new_projected)
-            
-            # 7. 收集分布残差
-            residuals = []
-            for cls in self.local_classes:
-                if self.distribution_pool.has_class(cls):
-                    dist = self.distribution_pool.get_distribution(cls)
-                    residuals.append(dist.residual)
-            
-            # 8. 将专家ID转换为簇ID（用于路由损失）
             target_clusters = torch.tensor(
                 [self.expert_to_cluster.get(exp.item(), 0) for exp in target_experts],
                 device=self.device
             )
             
-            # 9. 计算损失
-            losses = self.criterion(
-                cls_logits=cls_logits,
-                targets=labels,
-                routing_probs=routing_probs,
-                target_experts=target_clusters,  # 使用簇ID而不是专家ID
-                features=projected,
-                all_anchors=self.class_anchors,
-                valid_classes=self.local_classes,
-                old_logits=old_logits,
-                new_logits_for_old=new_logits_for_old,
-                old_classes=old_classes,
-                residuals=residuals
+            # 路由损失
+            log_probs = torch.log(routing_probs + 1e-10)
+            L_route = F.nll_loss(log_probs, target_clusters)
+            
+            # 对比损失
+            L_contrast = self.criterion.contrast_loss(
+                projected, labels, self.class_anchors
             )
             
-            # 9. 反向传播
-            losses['total'].backward()
-            
-            # 梯度裁剪
+            self.optimizer.zero_grad()
+            router_loss = L_route + 0.3 * L_contrast
+            router_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.router.parameters(), max_norm=1.0)
-            
             self.optimizer.step()
             
-            # 10. 更新分布的样本计数
-            for cls in labels.unique():
-                cls = cls.item()
-                if self.distribution_pool.has_class(cls):
-                    count = (labels == cls).sum().item()
-                    self.distribution_pool.get_distribution(cls).update_sample_count(count)
+            total_loss += router_loss.item()
+            loss_components['route'] += L_route.item()
+            loss_components['contrast'] += L_contrast.item()
             
-            # 统计
-            total_loss += losses['total'].item()
+            routed_clusters = torch.argmax(routing_probs, dim=-1)
+            routing_correct = (routed_clusters == target_clusters).sum().item()
+            total_routing_correct += routing_correct
+            total_routing_samples += len(labels)
+        
+        # 伪样本训练路由器
+        non_local_classes = [
+            c for c in range(len(self.class_anchors))
+            if c not in self.local_classes and self.distribution_pool.has_class(c)
+        ]
+        
+        if len(non_local_classes) > 0 and num_pseudo_samples > 0:
+            for cls in non_local_classes:
+                try:
+                    dist = self.distribution_pool.get_distribution(cls)
+                    if dist.sample_count < 10:
+                        continue
+                    
+                    # 采样（backbone 空间）
+                    z_pseudo = dist.sample(num_pseudo_samples)
+                    
+                    if torch.isnan(z_pseudo).any() or torch.isinf(z_pseudo).any():
+                        continue
+                    
+                    # 通过 Router 前向传播
+                    _, routing_probs, _ = self.router(z_pseudo)
+                    
+                    target_expert = self.expert_pool.get_expert_for_class(cls)
+                    if target_expert not in self.expert_to_cluster:
+                        continue
+                    target_cluster = self.expert_to_cluster[target_expert]
+                    target_clusters = torch.full(
+                        (num_pseudo_samples,), target_cluster,
+                        dtype=torch.long, device=self.device
+                    )
+                    
+                    log_probs = torch.log(routing_probs + 1e-10)
+                    L_pseudo_route = F.nll_loss(log_probs, target_clusters)
+                    
+                    if torch.isnan(L_pseudo_route) or torch.isinf(L_pseudo_route):
+                        continue
+                    
+                    self.optimizer.zero_grad()
+                    (lambda_pseudo * L_pseudo_route).backward()
+                    torch.nn.utils.clip_grad_norm_(self.router.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                    
+                    loss_components['pseudo'] += L_pseudo_route.item()
+                    
+                except Exception as e:
+                    continue
+        
+        num_batches = len(train_loader)
+        pseudo_batches = len(non_local_classes) if len(non_local_classes) > 0 else 1
+        
+        metrics = {
+            'loss': total_loss / num_batches,
+            'routing_accuracy': total_routing_correct / max(total_routing_samples, 1) * 100,
+        }
+        for key in loss_components:
+            if key == 'pseudo':
+                metrics[f'loss_{key}'] = loss_components[key] / pseudo_batches
+            else:
+                metrics[f'loss_{key}'] = loss_components[key] / num_batches
+        
+        return metrics
+    
+    def train_expert_only(
+        self,
+        train_loader: DataLoader,
+        old_classes: Optional[List[int]] = None
+    ) -> Dict[str, float]:
+        """
+        阶段2: 只训练专家（冻结路由器）
+        """
+        self.router.eval()
+        self.expert_pool.train()
+        
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        
+        loss_components = {'cls': 0.0, 'forget': 0.0}
+        for param in self.router.parameters():
+            param.requires_grad = False
+        for param in self.expert_pool.parameters():
+            param.requires_grad = True
+        
+        for batch_idx, (images, labels) in enumerate(train_loader):
+            images = images.to(self.device)
+            labels = labels.to(self.device)
             
-            # 计算准确率
+            with torch.no_grad():
+                backbone_features = self.backbone(images)
+                _, _, projected = self.router(backbone_features)
+                
+            projected = projected.detach().requires_grad_(True)
+            target_experts = torch.tensor(
+                [self.expert_pool.get_expert_for_class(l.item()) for l in labels],
+                device=self.device
+            )
+            
+            cls_logits, expert_features = self.expert_pool(
+                projected, target_experts, self.class_anchors
+            )
+            
+            # 分类损失
+            L_cls = F.cross_entropy(cls_logits, labels)
+            
+            # 防遗忘损失
+            L_forget = torch.tensor(0.0, device=self.device)
+            if old_classes and len(old_classes) > 0 and self.old_router is not None:
+                old_samples, old_labels = self.distribution_pool.sample_all(
+                    old_classes, num_samples_per_class=2
+                )
+                if old_samples is not None:
+                    with torch.no_grad():
+                        _, _, old_proj = self.old_router(old_samples)
+                        old_logits = self.old_router.compute_class_logits(old_proj)
+                    
+                    _, _, new_proj = self.router(old_samples)
+                    new_logits = self.router.compute_class_logits(new_proj)
+                    
+                    L_forget = self.criterion.forget_loss(
+                        old_logits, new_logits, old_classes
+                    )
+            
+            self.optimizer.zero_grad()
+            expert_loss = L_cls + 0.5 * L_forget
+            
+            expert_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.expert_pool.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            
+            total_loss += expert_loss.item()
+            loss_components['cls'] += L_cls.item()
+            loss_components['forget'] += L_forget.item()
+            
             valid_mask = torch.tensor(
                 [l.item() in self.local_classes for l in labels],
                 device=self.device
@@ -284,11 +382,7 @@ class FedAMEClient:
                 _, predicted = valid_logits.max(1)
                 total_correct += predicted.eq(valid_labels).sum().item()
                 total_samples += valid_mask.sum().item()
-            
-            for key in loss_components:
-                loss_components[key] += losses[key].item()
         
-        # 平均
         num_batches = len(train_loader)
         metrics = {
             'loss': total_loss / num_batches,
@@ -299,20 +393,111 @@ class FedAMEClient:
         
         return metrics
     
-    def get_model_updates(self) -> Dict[str, torch.Tensor]:
+    def train_distribution_only(
+        self,
+        num_iterations: int = 100,
+        num_samples_per_class: int = 16
+    ) -> Dict[str, float]:
         """
-        获取模型更新（用于联邦聚合）
+        阶段3: 训练分布参数（Prompt Tuning 思路）
         
-        Returns:
-            updates: {参数名: 参数值}
+        流程：
+        1. 从所有本地类批量采样（backbone 空间）
+        2. 通过冻结的 Router + Expert 前向传播
+        3. 使用分类损失 + 路由损失
+        4. 梯度只更新分布参数 (μ, σ)
         """
+        # 冻结 Router 和 Expert
+        self.router.eval()
+        self.expert_pool.eval()
+        for param in self.router.parameters():
+            param.requires_grad = False
+        for param in self.expert_pool.parameters():
+            param.requires_grad = False
+        
+        # 只训练分布参数
+        for param in self.distribution_pool.parameters():
+            param.requires_grad = True
+        
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        
+        loss_components = {'cls': 0.0, 'route': 0.0}
+        
+        for iteration in range(num_iterations):
+            # 1. 批量采样（backbone 空间）
+            features, labels = self.distribution_pool.sample_all(
+                self.local_classes, num_samples_per_class
+            )
+            
+            if features is None:
+                continue
+            
+            # 数值检查
+            if torch.isnan(features).any() or torch.isinf(features).any():
+                continue
+            
+            # 2. Router 前向传播
+            expert_ids, routing_probs, projected = self.router(features)
+            
+            # 目标路由
+            target_experts = torch.tensor(
+                [self.expert_pool.get_expert_for_class(l.item()) for l in labels],
+                device=self.device
+            )
+            target_clusters = torch.tensor(
+                [self.expert_to_cluster.get(exp.item(), 0) for exp in target_experts],
+                device=self.device
+            )
+            
+            # 路由损失
+            L_route = F.cross_entropy(
+                torch.log(routing_probs + 1e-10), target_clusters
+            )
+            
+            # 3. Expert 前向传播
+            cls_logits, _ = self.expert_pool(projected, target_experts, self.class_anchors)
+            
+            # 分类损失
+            L_cls = F.cross_entropy(cls_logits, labels)
+            
+            # 4. 总损失，更新分布参数
+            loss = L_cls + 0.5 * L_route
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.distribution_pool.parameters(),
+                max_norm=1.0
+            )
+            self.optimizer.step()
+            
+            # 统计
+            total_loss += loss.item()
+            loss_components['cls'] += L_cls.item()
+            loss_components['route'] += L_route.item()
+            
+            _, predicted = cls_logits.max(1)
+            total_correct += predicted.eq(labels).sum().item()
+            total_samples += len(labels)
+        
+        metrics = {
+            'loss': total_loss / max(num_iterations, 1),
+            'accuracy': total_correct / max(total_samples, 1) * 100,
+            'loss_cls': loss_components['cls'] / max(num_iterations, 1),
+            'loss_route': loss_components['route'] / max(num_iterations, 1),
+        }
+        
+        return metrics
+    
+    def get_model_updates(self) -> Dict[str, torch.Tensor]:
+        """获取模型更新（用于联邦聚合）"""
         updates = {}
         
-        # 路由层参数
         for name, param in self.router.named_parameters():
             updates[f'router.{name}'] = param.data.clone()
         
-        # 本地专家参数
         for exp_id in self.local_experts:
             expert = self.expert_pool.get_expert(exp_id)
             for name, param in expert.named_parameters():
@@ -330,14 +515,7 @@ class FedAMEClient:
         global_expert_states: Dict[int, Dict[str, torch.Tensor]],
         global_distribution_params: Optional[Dict[int, Dict]] = None
     ):
-        """
-        加载全局模型
-        
-        Args:
-            global_router_state: 全局路由层参数
-            global_expert_states: 全局专家参数 {expert_id: state_dict}
-            global_distribution_params: 全局分布参数
-        """
+        """加载全局模型"""
         # 加载路由层
         router_state = {}
         for key, value in global_router_state.items():
@@ -347,64 +525,74 @@ class FedAMEClient:
                 router_state[key] = value
         self.router.load_state_dict(router_state, strict=False)
         
-        # 加载专家（先确保专家存在，再加载参数）
+        # 加载专家
         for exp_id, exp_state in global_expert_states.items():
-            # 如果专家不存在，先创建并移动到正确设备
             if str(exp_id) not in self.expert_pool.experts:
                 self.expert_pool.add_expert(exp_id)
                 self.expert_pool.experts[str(exp_id)].to(self.device)
-            # 加载参数
             self.expert_pool.get_expert(exp_id).load_state_dict(exp_state)
         
         # 加载分布参数
         if global_distribution_params:
-            for cls in self.local_classes:
-                if cls in global_distribution_params:
-                    self.distribution_pool.set_class_params(
-                        cls, global_distribution_params[cls]
-                    )
+            for cls, params in global_distribution_params.items():
+                if not self.distribution_pool.has_class(cls):
+                    # 用全局参数的 mean 初始化
+                    self.distribution_pool.add_class(cls, init_mean=params['mean'].to(self.device))
+                self.distribution_pool.set_class_params(cls, params)
     
     def evaluate(
         self,
         test_loader: DataLoader,
         classes_to_eval: Optional[List[int]] = None
     ) -> Dict[str, float]:
-        """
-        评估模型
-        
-        Args:
-            test_loader: 测试数据加载器
-            classes_to_eval: 要评估的类别（None表示全部）
-        
-        Returns:
-            metrics: 评估指标
-        """
+        """评估模型"""
         self.router.eval()
         self.expert_pool.eval()
         
         total_correct = 0
         total_samples = 0
+        routing_correct = 0
+        routing_samples = 0
+        expert_correct_with_gt_routing = 0
+        expert_samples = 0
+        
         class_correct = {}
         class_total = {}
+        class_routing_correct = {}
+        class_routing_total = {}
         
         with torch.no_grad():
             for images, labels in test_loader:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
                 
-                # 前向传播
                 backbone_features = self.backbone(images)
-                expert_ids, routing_probs, projected = self.router(backbone_features)
+                routed_expert_ids, routing_probs, projected = self.router(backbone_features)
                 
-                # 使用路由选择的专家
-                cls_logits, _ = self.expert_pool(
-                    projected, expert_ids, self.class_anchors
+                target_experts = torch.tensor(
+                    [self.expert_pool.get_expert_for_class(l.item()) for l in labels],
+                    device=self.device
                 )
+                target_clusters = torch.tensor(
+                    [self.expert_to_cluster.get(exp.item(), 0) for exp in target_experts],
+                    device=self.device
+                )
+                routed_clusters = torch.argmax(routing_probs, dim=-1)
                 
-                # 预测
-                _, predicted = cls_logits.max(1)
+                routing_match = (routed_clusters == target_clusters)
+                routing_correct += routing_match.sum().item()
+                routing_samples += len(labels)
                 
-                # 统计
+                cls_logits_routed, _ = self.expert_pool(
+                    projected, routed_expert_ids, self.class_anchors
+                )
+                _, predicted_routed = cls_logits_routed.max(1)
+                
+                cls_logits_gt, _ = self.expert_pool(
+                    projected, target_experts, self.class_anchors
+                )
+                _, predicted_gt = cls_logits_gt.max(1)
+                
                 for i in range(len(labels)):
                     label = labels[i].item()
                     
@@ -414,24 +602,40 @@ class FedAMEClient:
                     if label not in class_total:
                         class_total[label] = 0
                         class_correct[label] = 0
+                        class_routing_total[label] = 0
+                        class_routing_correct[label] = 0
                     
                     class_total[label] += 1
-                    if predicted[i].item() == label:
+                    class_routing_total[label] += 1
+                    
+                    if predicted_routed[i].item() == label:
                         class_correct[label] += 1
                         total_correct += 1
+                    
+                    if routing_match[i].item():
+                        class_routing_correct[label] += 1
+                    
+                    if predicted_gt[i].item() == label:
+                        expert_correct_with_gt_routing += 1
+                    
                     total_samples += 1
+                    expert_samples += 1
         
-        # 计算指标
         metrics = {
             'accuracy': total_correct / max(total_samples, 1) * 100,
+            'routing_accuracy': routing_correct / max(routing_samples, 1) * 100,
+            'expert_accuracy_with_gt_routing': expert_correct_with_gt_routing / max(expert_samples, 1) * 100,
             'total_samples': total_samples
         }
         
-        # 每个类的准确率
         for cls in class_total:
             metrics[f'class_{cls}_acc'] = (
                 class_correct[cls] / class_total[cls] * 100
                 if class_total[cls] > 0 else 0
+            )
+            metrics[f'class_{cls}_routing_acc'] = (
+                class_routing_correct[cls] / class_routing_total[cls] * 100
+                if class_routing_total[cls] > 0 else 0
             )
         
         return metrics

@@ -25,6 +25,50 @@ from anchor import create_anchor_generator, LLMDecisionMaker
 from federated import FedAMEClient, FedAMEServer
 
 
+def print_routing_diagnosis(diagnosis: Dict, indent: str = "   "):
+    """
+    打印路由诊断信息
+    
+    Args:
+        diagnosis: 路由诊断结果字典
+        indent: 缩进字符串
+    """
+    class_routing_stats = diagnosis['class_routing_stats']
+    class_expected_expert = diagnosis['class_expected_expert']
+    class_total_samples = diagnosis['class_total_samples']
+    class_routing_accuracy = diagnosis['class_routing_accuracy']
+    class_names = diagnosis['class_names']
+    
+    for cls in sorted(class_routing_stats.keys()):
+        expected_exp = class_expected_expert[cls]
+        total = class_total_samples[cls]
+        correct = class_routing_stats[cls].get(expected_exp, 0)
+        accuracy = class_routing_accuracy[cls]
+        
+        # 构建实际路由分布
+        routing_dist = []
+        for exp_id in sorted(class_routing_stats[cls].keys()):
+            count = class_routing_stats[cls][exp_id]
+            routing_dist.append(f"E{exp_id}:{count}")
+        
+        # 判断是否正确
+        is_correct = accuracy > 0.5
+        status = "✓" if is_correct else "✗"
+        
+        # 打印
+        class_name = class_names[cls] if cls < len(class_names) else f"class_{cls}"
+        print(f"{indent}{status} {class_name:12s} (class {cls}) → "
+              f"Expected: E{expected_exp}, "
+              f"Actual: [{', '.join(routing_dist)}], "
+              f"Correct: {correct}/{total} ({accuracy*100:.1f}%)")
+    
+    # 打印总体准确率
+    print(f"{indent}📊 Overall Routing Accuracy: "
+          f"{diagnosis['total_correct']}/{diagnosis['total_samples']} "
+          f"({diagnosis['overall_accuracy']*100:.1f}%)")
+
+
+
 def set_seed(seed: int):
     """设置随机种子"""
     random.seed(seed)
@@ -74,9 +118,8 @@ def create_clients(
         
         # 创建分布池
         distribution_pool = DistributionPool(
-            anchor_dim=config.model.anchor_dim
+            dim=config.model.feature_dim  # backbone 输出维度，512
         )
-        distribution_pool.set_anchors(server.class_anchors)
         
         # 创建客户端
         client = FedAMEClient(
@@ -152,7 +195,18 @@ def train_task(
             class_to_expert=client_config['class_to_expert'],
             expert_to_cluster=client_config['expert_to_cluster']
         )
-        
+
+        # 创建本地数据加载器（用于初始化分布）
+        train_subset = Subset(fed_data.train_dataset, indices)
+        init_loader = create_data_loaders(
+            train_subset,
+            batch_size=config.federated.local_batch_size,
+            shuffle=False
+        )
+
+        # 用真实特征初始化分布
+        clients[k].init_distributions_from_data(init_loader)
+
         # 保存旧模型（用于防遗忘）
         if len(old_classes) > 0:
             clients[k].save_old_model()
@@ -216,9 +270,36 @@ def train_task(
                 shuffle=True
             )
             
-            # 本地训练
+            # 本地训练（3阶段）
+            # 阶段1: 训练路由器
             for epoch in range(config.federated.local_epochs):
-                metrics = clients[k].train_epoch(train_loader, old_classes)
+                router_metrics = clients[k].train_router_only(
+                    train_loader,
+                    num_pseudo_samples=50,
+                    lambda_pseudo=0.2
+                )
+            print(k)
+            print('router', router_metrics)
+            # 阶段2: 训练专家
+            for epoch in range(config.federated.local_epochs):
+                expert_metrics = clients[k].train_expert_only(
+                    train_loader,
+                    old_classes
+                )
+            print('expert', expert_metrics)
+            # 阶段3: 训练分布参数
+            for epoch in range(config.federated.local_epochs):
+                dist_metrics = clients[k].train_distribution_only(
+                    num_iterations=100,
+                    num_samples_per_class=16
+                )
+            print('Prob', dist_metrics)
+            # 合并metrics
+            metrics = {
+                'loss': (router_metrics.get('loss', 0) + expert_metrics.get('loss', 0) + dist_metrics.get('loss', 0)) / 3,
+                'accuracy': expert_metrics.get('accuracy', 0),
+                'routing_accuracy': router_metrics.get('routing_accuracy', 0)
+            }
             
             # 收集更新
             client_updates[k] = clients[k].get_model_updates()
@@ -247,29 +328,59 @@ def train_task(
                 client_config['distribution_params']
             )
         
-        # 4.5 评估全局模型
+        # 4.5 评估本地和全局模型
+        # 本地评估（随机选一个客户端）
+        sample_client_id = active_clients[0]
+        local_eval_metrics = clients[sample_client_id].evaluate(test_loader)
+        
+        # 全局评估
         eval_metrics = server.evaluate(test_loader)
+        
+        round_metrics['local_test_acc'] = local_eval_metrics['accuracy']
+        round_metrics['local_routing_acc'] = local_eval_metrics['routing_accuracy']
+        round_metrics['local_expert_acc_gt'] = local_eval_metrics['expert_accuracy_with_gt_routing']
+        
         round_metrics['global_test_acc'] = eval_metrics['accuracy']
+        round_metrics['global_routing_acc'] = eval_metrics['routing_accuracy']
+        round_metrics['global_expert_acc_gt'] = eval_metrics['expert_accuracy_with_gt_routing']
         
         # 计算平均值
         avg_loss = sum(client_losses) / len(client_losses)
         avg_train_acc = sum(client_train_accs) / len(client_train_accs)
         
-        # 打印日志
+        # 打印基本日志
         print(f"Round {round_idx + 1:3d}/{config.training.num_rounds} | "
               f"Clients: {len(active_clients)}/{len(all_active_clients)} | "
               f"Loss: {avg_loss:.4f} | "
               f"Train: {avg_train_acc:.2f}% | "
-              f"Test: {eval_metrics['accuracy']:.2f}%", end="")
+              f"Test: {eval_metrics['accuracy']:.2f}% | "
+              f"Route: {eval_metrics['routing_accuracy']:.1f}%", end="")
         
-        # 定期打印详细的每类准确率
+        # 定期打印详细信息
         if (round_idx + 1) % config.log_interval == 0:
             class_accs = []
             for cls in test_classes:
                 key = f'class_{cls}_acc'
                 if key in eval_metrics:
                     class_accs.append(f"{fed_data.class_names[cls]}:{eval_metrics[key]:.1f}%")
-            print(f"\n         Per-class: {', '.join(class_accs)}")
+            print(f"\n         Per-class Acc: {', '.join(class_accs)}")
+            
+            # 打印本地性能（Client #{sample_client_id}）
+            print(f"\n         📱 Local (Client #{sample_client_id}):")
+            print(f"            Acc: {local_eval_metrics['accuracy']:.2f}% | "
+                  f"Routing: {local_eval_metrics['routing_accuracy']:.2f}% | "
+                  f"Expert (GT): {local_eval_metrics['expert_accuracy_with_gt_routing']:.2f}%")
+            
+            # 打印全局性能
+            print(f"         🌍 Global:")
+            print(f"            Acc: {eval_metrics['accuracy']:.2f}% | "
+                  f"Routing: {eval_metrics['routing_accuracy']:.2f}% | "
+                  f"Expert (GT): {eval_metrics['expert_accuracy_with_gt_routing']:.2f}%")
+            
+            # 路由诊断
+            print("         🔀 Routing Diagnosis (class → expert):")
+            diagnosis = server.diagnose_routing(test_loader, fed_data.class_names)
+            print_routing_diagnosis(diagnosis, indent="            ")
         else:
             print()  # 换行
         

@@ -5,6 +5,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from typing import Dict, List, Optional, Tuple
 import copy
 
@@ -120,9 +121,11 @@ class FedAMEServer:
         
         # 全局分布池
         self.global_distribution_pool = DistributionPool(
-            anchor_dim=config.get('anchor_dim', 512)
+            dim=config.get('feature_dim', 512)  # backbone 输出维度
         )
-        self.global_distribution_pool.set_anchors(self.class_anchors)
+        self.global_distribution_pool = DistributionPool(
+            dim=config.get('feature_dim', 512)  # backbone 输出维度
+        )
     
     def _sync_expert_assignments(self):
         """同步专家分配到专家池"""
@@ -233,9 +236,9 @@ class FedAMEServer:
             expert = self.global_expert_pool.get_expert(exp_id)
             expert_states[exp_id] = expert.state_dict()
         
-        # 获取相关类的分布参数
+        # 获取所有已学习类的分布参数（用于伪样本训练）
         distribution_params = {}
-        for cls in client_classes:
+        for cls in self.learned_classes:
             if self.global_distribution_pool.has_class(cls):
                 distribution_params[cls] = (
                     self.global_distribution_pool.get_distribution(cls).get_params()
@@ -245,10 +248,11 @@ class FedAMEServer:
             'client_id': client_id,
             'local_classes': client_classes,
             'local_experts': list(needed_experts),
-            'class_to_expert': {
-                cls: self.global_expert_pool.get_expert_for_class(cls)
-                for cls in client_classes
-            },
+            # 'class_to_expert': {
+            #     cls: self.global_expert_pool.get_expert_for_class(cls)
+            #     for cls in self.learned_classes  # 所有已学习的类
+            # },
+            'class_to_expert': self.global_expert_pool.class_to_expert.copy(),
             'expert_to_cluster': self.get_expert_to_cluster(),
             'router_state': self.global_router.state_dict(),
             'expert_states': expert_states,
@@ -415,14 +419,15 @@ class FedAMEServer:
         # 聚合
         global_params = aggregate_distributions(
             params_list,
-            self.class_anchors.cpu(),
-            anchor_dim=self.class_anchors.size(1)
+            dim=self.global_distribution_pool.dim
         )
         
         # 更新全局分布
         for cls, params in global_params.items():
-            if self.global_distribution_pool.has_class(cls):
-                self.global_distribution_pool.set_class_params(cls, params)
+            if not self.global_distribution_pool.has_class(cls):
+                # 用聚合后的 mean 初始化
+                self.global_distribution_pool.add_class(cls, init_mean=params['mean'])
+            self.global_distribution_pool.set_class_params(cls, params)
     
     def finish_task(self, task_classes: List[int]):
         """
@@ -432,22 +437,32 @@ class FedAMEServer:
             if cls not in self.learned_classes:
                 self.learned_classes.append(cls)
     
-    def evaluate(
+    def diagnose_routing(
         self,
-        test_loader,
-        classes_to_eval: Optional[List[int]] = None
-    ) -> Dict[str, float]:
+        test_loader: DataLoader,
+        class_names: Optional[List[str]] = None
+    ) -> Dict:
         """
-        评估全局模型
+        诊断路由情况 - 分析每个类别被路由到哪些专家
+        
+        Args:
+            test_loader: 测试数据加载器
+            class_names: 类别名称列表
+        
+        Returns:
+            diagnosis: 路由诊断结果
         """
         self.backbone.eval()
         self.global_router.eval()
         self.global_expert_pool.eval()
         
-        total_correct = 0
-        total_samples = 0
-        class_correct = {}
-        class_total = {}
+        if class_names is None:
+            class_names = [f"class_{i}" for i in range(len(self.class_anchors))]
+        
+        # 统计每个类被路由到哪些专家
+        class_routing_stats = {}  # {class_id: {expert_id: count}}
+        class_expected_expert = {}  # {class_id: expected_expert_id}
+        class_total_samples = {}  # {class_id: total_count}
         
         with torch.no_grad():
             for images, labels in test_loader:
@@ -456,12 +471,116 @@ class FedAMEServer:
                 
                 # 前向传播
                 backbone_features = self.backbone(images)
-                expert_ids, _, projected = self.global_router(backbone_features)
-                cls_logits, _ = self.global_expert_pool(
-                    projected, expert_ids, self.class_anchors
-                )
+                routed_expert_ids, routing_probs, projected = self.global_router(backbone_features)
                 
-                _, predicted = cls_logits.max(1)
+                # 统计路由结果
+                for i in range(len(labels)):
+                    cls = labels[i].item()
+                    routed_exp = routed_expert_ids[i].item()
+                    
+                    # 初始化统计
+                    if cls not in class_routing_stats:
+                        class_routing_stats[cls] = {}
+                        class_total_samples[cls] = 0
+                        class_expected_expert[cls] = self.global_expert_pool.get_expert_for_class(cls)
+                    
+                    # 统计路由到的专家
+                    if routed_exp not in class_routing_stats[cls]:
+                        class_routing_stats[cls][routed_exp] = 0
+                    class_routing_stats[cls][routed_exp] += 1
+                    class_total_samples[cls] += 1
+        
+        # 计算每个类的路由准确率
+        class_routing_accuracy = {}
+        total_correct = 0
+        total_samples = 0
+        
+        for cls in class_routing_stats:
+            expected_exp = class_expected_expert[cls]
+            correct = class_routing_stats[cls].get(expected_exp, 0)
+            total = class_total_samples[cls]
+            
+            class_routing_accuracy[cls] = correct / total if total > 0 else 0
+            total_correct += correct
+            total_samples += total
+        
+        overall_accuracy = total_correct / total_samples if total_samples > 0 else 0
+        
+        return {
+            'class_routing_stats': class_routing_stats,
+            'class_expected_expert': class_expected_expert,
+            'class_total_samples': class_total_samples,
+            'class_routing_accuracy': class_routing_accuracy,
+            'overall_accuracy': overall_accuracy,
+            'total_correct': total_correct,
+            'total_samples': total_samples,
+            'class_names': class_names
+        }
+    
+    def evaluate(
+        self,
+        test_loader,
+        classes_to_eval: Optional[List[int]] = None
+    ) -> Dict[str, float]:
+        """
+        评估全局模型（分离评估路由和专家）
+        """
+        self.backbone.eval()
+        self.global_router.eval()
+        self.global_expert_pool.eval()
+        
+        total_correct = 0
+        total_samples = 0
+        
+        # 路由评估
+        routing_correct = 0
+        routing_samples = 0
+        
+        # 专家评估（假设路由正确）
+        expert_correct_with_gt_routing = 0
+        expert_samples = 0
+        
+        class_correct = {}
+        class_total = {}
+        class_routing_correct = {}
+        class_routing_total = {}
+        
+        with torch.no_grad():
+            for images, labels in test_loader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+                
+                # 前向传播
+                backbone_features = self.backbone(images)
+                routed_expert_ids, routing_probs, projected = self.global_router(backbone_features)
+                
+                # ===== 评估路由准确率 =====
+                target_experts = torch.tensor(
+                    [self.global_expert_pool.get_expert_for_class(l.item()) for l in labels],
+                    device=self.device
+                )
+                expert_to_cluster = self.get_expert_to_cluster()
+                target_clusters = torch.tensor(
+                    [expert_to_cluster.get(exp.item(), 0) for exp in target_experts],
+                    device=self.device
+                )
+                routed_clusters = torch.argmax(routing_probs, dim=-1)
+                
+                routing_match = (routed_clusters == target_clusters)
+                routing_correct += routing_match.sum().item()
+                routing_samples += len(labels)
+                
+                # ===== 评估专家准确率（使用路由的专家） =====
+                cls_logits_routed, _ = self.global_expert_pool(
+                    projected, routed_expert_ids, self.class_anchors
+                )
+                _, predicted_routed = cls_logits_routed.max(1)
+                
+                # ===== 评估专家准确率（使用ground truth专家） =====
+                cls_logits_gt, _ = self.global_expert_pool(
+                    projected, target_experts, self.class_anchors
+                )
+                _, predicted_gt = cls_logits_gt.max(1)
                 
                 for i in range(len(labels)):
                     label = labels[i].item()
@@ -472,15 +591,32 @@ class FedAMEServer:
                     if label not in class_total:
                         class_total[label] = 0
                         class_correct[label] = 0
+                        class_routing_total[label] = 0
+                        class_routing_correct[label] = 0
                     
                     class_total[label] += 1
-                    if predicted[i].item() == label:
+                    class_routing_total[label] += 1
+                    
+                    # 总体准确率（路由的专家）
+                    if predicted_routed[i].item() == label:
                         class_correct[label] += 1
                         total_correct += 1
+                    
+                    # 路由准确率
+                    if routing_match[i].item():
+                        class_routing_correct[label] += 1
+                    
+                    # 专家准确率（ground truth路由）
+                    if predicted_gt[i].item() == label:
+                        expert_correct_with_gt_routing += 1
+                    
                     total_samples += 1
+                    expert_samples += 1
         
         metrics = {
             'accuracy': total_correct / max(total_samples, 1) * 100,
+            'routing_accuracy': routing_correct / max(routing_samples, 1) * 100,
+            'expert_accuracy_with_gt_routing': expert_correct_with_gt_routing / max(expert_samples, 1) * 100,
             'total_samples': total_samples
         }
         
@@ -488,6 +624,10 @@ class FedAMEServer:
             metrics[f'class_{cls}_acc'] = (
                 class_correct[cls] / class_total[cls] * 100
                 if class_total[cls] > 0 else 0
+            )
+            metrics[f'class_{cls}_routing_acc'] = (
+                class_routing_correct[cls] / class_routing_total[cls] * 100
+                if class_routing_total[cls] > 0 else 0
             )
         
         return metrics
