@@ -41,15 +41,12 @@ class AnchorGenerator:
         try:
             from transformers import CLIPModel, CLIPProcessor, CLIPTokenizer
             
-            print(f"Loading CLIP model: {self.model_name}")
             self._model = CLIPModel.from_pretrained(self.model_name)
             self._processor = CLIPProcessor.from_pretrained(self.model_name)
             self._tokenizer = CLIPTokenizer.from_pretrained(self.model_name)
             
             self._model = self._model.to(self.device)
             self._model.eval()
-            
-            print("CLIP model loaded successfully")
             
         except ImportError:
             warnings.warn(

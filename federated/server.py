@@ -85,9 +85,6 @@ class FedAMEServer:
         self.cluster_anchors = self.anchor_generator.generate_anchors(
             self.cluster_names
         ).to(self.device)
-        
-        print(f"Generated class anchors: {self.class_anchors.shape}")
-        print(f"Generated cluster anchors: {self.cluster_anchors.shape}")
     
     def _init_global_model(self, config: Dict):
         """初始化全局模型"""
@@ -148,10 +145,6 @@ class FedAMEServer:
         """
         new_classes = [c for c in task_classes if c not in self.learned_classes]
         
-        print(f"\n{'='*50}")
-        print(f"Preparing task with classes: {[self.class_names[c] for c in task_classes]}")
-        print(f"New classes: {[self.class_names[c] for c in new_classes]}")
-        
         # 为新类分配专家
         for cls in new_classes:
             class_name = self.class_names[cls]
@@ -196,11 +189,16 @@ class FedAMEServer:
             'expert_info': self.global_expert_pool.get_expert_info()
         }
         
-        print(f"Expert assignments: {task_info['expert_assignments']}")
-        print(f"Expert info: {task_info['expert_info']}")
-        print('='*50)
-        
         return task_info
+    
+    def get_expert_to_cluster(self) -> Dict[int, int]:
+        """获取专家到簇的映射"""
+        expert_to_cluster = {}
+        for exp_id, info in self.expert_manager.expert_info.items():
+            cluster_name = info.get('cluster', self.cluster_names[0])
+            cluster_idx = self.cluster_names.index(cluster_name) if cluster_name in self.cluster_names else 0
+            expert_to_cluster[exp_id] = cluster_idx
+        return expert_to_cluster
     
     def get_client_config(
         self,
@@ -251,6 +249,7 @@ class FedAMEServer:
                 cls: self.global_expert_pool.get_expert_for_class(cls)
                 for cls in client_classes
             },
+            'expert_to_cluster': self.get_expert_to_cluster(),
             'router_state': self.global_router.state_dict(),
             'expert_states': expert_states,
             'distribution_params': distribution_params,
@@ -261,7 +260,9 @@ class FedAMEServer:
     def aggregate(
         self,
         client_updates: Dict[int, Dict],
-        client_distribution_params: Dict[int, Dict[int, Dict]]
+        client_distribution_params: Dict[int, Dict[int, Dict]],
+        client_sample_counts: Dict[int, int] = None,
+        client_class_counts: Dict[int, Dict[int, int]] = None
     ):
         """
         聚合客户端更新
@@ -269,30 +270,41 @@ class FedAMEServer:
         Args:
             client_updates: {client_id: {param_name: param_value}}
             client_distribution_params: {client_id: {class_id: params}}
+            client_sample_counts: {client_id: num_samples} 客户端总样本数
+            client_class_counts: {client_id: {class_id: count}} 客户端每类样本数
         """
-        print("\nAggregating client updates...")
+        # 1. 聚合路由层（按客户端数据量加权）
+        self._aggregate_router(client_updates, client_sample_counts)
         
-        # 1. 聚合路由层（所有客户端参与）
-        self._aggregate_router(client_updates)
-        
-        # 2. 聚合专家（按专家分组）
-        self._aggregate_experts(client_updates)
+        # 2. 聚合专家（按对应类的数据量加权）
+        self._aggregate_experts(client_updates, client_class_counts)
         
         # 3. 聚合分布参数
         self._aggregate_distributions(client_distribution_params)
-        
-        print("Aggregation complete.")
     
-    def _aggregate_router(self, client_updates: Dict[int, Dict]):
-        """聚合路由层"""
+    def _aggregate_router(
+        self, 
+        client_updates: Dict[int, Dict],
+        client_sample_counts: Dict[int, int] = None
+    ):
+        """聚合路由层 - 按数据量加权"""
         if len(client_updates) == 0:
             return
+        
+        # 计算权重
+        if client_sample_counts:
+            total_samples = sum(client_sample_counts.get(cid, 1) for cid in client_updates.keys())
+            weights = {cid: client_sample_counts.get(cid, 1) / total_samples 
+                      for cid in client_updates.keys()}
+        else:
+            # 简单平均
+            weights = {cid: 1.0 / len(client_updates) for cid in client_updates.keys()}
         
         # 收集路由层参数
         router_params = {}
         
         for client_id, updates in client_updates.items():
-            client_weight = 1.0 / len(client_updates)  # 简单平均
+            client_weight = weights[client_id]
             
             for name, value in updates.items():
                 if name.startswith('router.'):
@@ -309,8 +321,12 @@ class FedAMEServer:
         
         self.global_router.load_state_dict(global_state)
     
-    def _aggregate_experts(self, client_updates: Dict[int, Dict]):
-        """聚合专家（按专家分组）"""
+    def _aggregate_experts(
+        self, 
+        client_updates: Dict[int, Dict],
+        client_class_counts: Dict[int, Dict[int, int]] = None
+    ):
+        """聚合专家 - 只有拥有对应类数据的客户端参与，按数据量加权"""
         # 收集每个专家的更新
         expert_updates: Dict[int, List[Dict]] = {}
         
@@ -346,11 +362,34 @@ class FedAMEServer:
             expert = self.global_expert_pool.get_expert(exp_id)
             global_state = expert.state_dict()
             
-            # 简单平均
-            weight = 1.0 / len(updates_list)
+            # 获取该专家负责的类
+            responsible_classes = expert.responsible_classes
+            
+            # 计算每个客户端对该专家的权重（基于对应类的样本数）
+            if client_class_counts and responsible_classes:
+                client_weights = {}
+                total_weight = 0
+                for upd in updates_list:
+                    cid = upd['client_id']
+                    # 统计该客户端在该专家负责类上的样本数
+                    weight = sum(
+                        client_class_counts.get(cid, {}).get(cls, 0) 
+                        for cls in responsible_classes
+                    )
+                    weight = max(weight, 1)  # 至少为1
+                    client_weights[cid] = weight
+                    total_weight += weight
+                
+                # 归一化
+                for cid in client_weights:
+                    client_weights[cid] /= total_weight
+            else:
+                # 简单平均
+                client_weights = {upd['client_id']: 1.0 / len(updates_list) for upd in updates_list}
             
             aggregated = {}
             for upd in updates_list:
+                weight = client_weights[upd['client_id']]
                 for name, value in upd['params'].items():
                     if name not in aggregated:
                         aggregated[name] = torch.zeros_like(value)
@@ -392,8 +431,6 @@ class FedAMEServer:
         for cls in task_classes:
             if cls not in self.learned_classes:
                 self.learned_classes.append(cls)
-        
-        print(f"Task finished. Learned classes: {self.learned_classes}")
     
     def evaluate(
         self,

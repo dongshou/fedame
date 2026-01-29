@@ -36,10 +36,18 @@ class DataConfig:
         "dog", "frog", "horse", "ship", "truck"
     ])
     
-    # 语义簇定义
+    # 语义簇定义 - 每个类一个簇（极端配置）
     semantic_clusters: Dict[str, List[str]] = field(default_factory=lambda: {
-        "animals": ["bird", "cat", "deer", "dog", "frog", "horse"],
-        "vehicles": ["airplane", "automobile", "ship", "truck"]
+        "airplane": ["airplane"],
+        "automobile": ["automobile"],
+        "bird": ["bird"],
+        "cat": ["cat"],
+        "deer": ["deer"],
+        "dog": ["dog"],
+        "frog": ["frog"],
+        "horse": ["horse"],
+        "ship": ["ship"],
+        "truck": ["truck"]
     })
 
 @dataclass
@@ -56,9 +64,9 @@ class ModelConfig:
     
     # Expert
     expert_hidden_dim: int = 256
-    expert_output_dim: int = 128
-    num_initial_experts: int = 2
-    max_classes_per_expert: int = 6
+    expert_output_dim: int = 512  # 必须与anchor_dim一致，用于计算相似度
+    num_initial_experts: int = 10  # 每个类一个专家
+    max_classes_per_expert: int = 1  # 每个专家只负责一个类
     
     # Anchor
     anchor_dim: int = 512  # CLIP embedding dimension
@@ -70,10 +78,10 @@ class ModelConfig:
 @dataclass
 class FederatedConfig:
     """联邦学习配置"""
-    num_clients: int = 5
-    participation_rate: float = 1.0  # 每轮参与的客户端比例
+    num_clients: int = 100
+    participation_rate: float = 0.1  # 每轮参与的客户端比例
     local_epochs: int = 5
-    local_batch_size: int = 32
+    local_batch_size: int = 64
     
     # 数据异构性
     alpha: float = 0.5  # Dirichlet分布参数，越小异构性越强
@@ -82,10 +90,15 @@ class FederatedConfig:
 class IncrementalConfig:
     """增量学习配置"""
     # 任务划分 (CIFAR-10 分成多个任务)
+    # tasks: List[List[int]] = field(default_factory=lambda: [
+    #     [0, 1, 2, 3],    # Task 1: airplane, automobile, bird, cat
+    #     [4, 5, 6, 7],    # Task 2: deer, dog, frog, horse
+    #     [8, 9]           # Task 3: ship, truck
+    # ])
     tasks: List[List[int]] = field(default_factory=lambda: [
-        [0, 1, 2, 3],    # Task 1: airplane, automobile, bird, cat
-        [4, 5, 6, 7],    # Task 2: deer, dog, frog, horse
-        [8, 9]           # Task 3: ship, truck
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],    # Task 1: airplane, automobile, bird, cat
+        # [4, 5, 6, 7],    # Task 2: deer, dog, frog, horse
+        # [8, 9]           # Task 3: ship, truck
     ])
     
     num_tasks: int = 3

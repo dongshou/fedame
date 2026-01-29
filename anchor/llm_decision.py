@@ -34,12 +34,8 @@ class LLMDecisionMaker:
             try:
                 import requests
                 self.requests = requests
-                print("LLM Decision Maker initialized with real API")
             except ImportError:
-                print("requests library not available, falling back to rule-based")
                 self.use_real_llm = False
-        else:
-            print("LLM Decision Maker initialized with rule-based fallback")
     
     def _call_api(self, prompt: str) -> str:
         """调用DeepSeek API"""
@@ -165,30 +161,15 @@ class LLMDecisionMaker:
         threshold: float
     ) -> Dict:
         """基于规则的专家分配"""
-        # 预定义语义映射
-        class_to_cluster = {
-            "airplane": "vehicles", "automobile": "vehicles",
-            "bird": "animals", "cat": "animals",
-            "deer": "animals", "dog": "animals",
-            "frog": "animals", "horse": "animals",
-            "ship": "vehicles", "truck": "vehicles"
-        }
-        
-        cluster = class_to_cluster.get(new_class, "animals")
+        # 每个类对应自己的簇
+        cluster = new_class if new_class in cluster_names else cluster_names[0]
         cluster_idx = cluster_names.index(cluster) if cluster in cluster_names else 0
         
         # 找到负责该簇的专家
         target_expert = None
         for exp_id, info in expert_info.items():
-            classes = info.get('responsible_classes', [])
-            if len(classes) > 0:
-                # 检查该专家是否已负责同簇的类
-                for cls in classes:
-                    cls_name = class_names[cls] if cls < len(class_names) else ""
-                    if class_to_cluster.get(cls_name) == cluster:
-                        target_expert = exp_id
-                        break
-            if target_expert is not None:
+            if info.get('cluster') == cluster:
+                target_expert = exp_id
                 break
         
         if target_expert is not None:
@@ -196,13 +177,13 @@ class LLMDecisionMaker:
                 'action': 'assign',
                 'expert_id': target_expert,
                 'cluster': cluster,
-                'reason': f'{new_class} belongs to {cluster}, same as Expert_{target_expert}'
+                'reason': f'{new_class} assigned to Expert_{target_expert}'
             }
         else:
             return {
                 'action': 'new',
                 'cluster': cluster,
-                'reason': f'No expert currently handles {cluster}'
+                'reason': f'Create new expert for {new_class}'
             }
     
     def decide_expert_split(
@@ -298,16 +279,10 @@ class LLMDecisionMaker:
         available_clusters: List[str]
     ) -> str:
         """建议类别应该归属的簇"""
-        # 预定义映射
-        class_to_cluster = {
-            "airplane": "vehicles", "automobile": "vehicles",
-            "bird": "animals", "cat": "animals",
-            "deer": "animals", "dog": "animals",
-            "frog": "animals", "horse": "animals",
-            "ship": "vehicles", "truck": "vehicles"
-        }
-        
-        return class_to_cluster.get(class_name, available_clusters[0])
+        # 每个类对应自己的簇
+        if class_name in available_clusters:
+            return class_name
+        return available_clusters[0] if available_clusters else class_name
 
 
 class ExpertManager:
@@ -371,8 +346,6 @@ class ExpertManager:
             cluster_names=self.cluster_names
         )
         
-        print(f"Assignment decision for '{new_class}': {decision}")
-        
         if decision['action'] == 'assign':
             expert_id = decision['expert_id']
         else:
@@ -418,8 +391,6 @@ class ExpertManager:
         
         if not decision['split']:
             return None
-        
-        print(f"Split decision for Expert_{expert_id}: {decision}")
         
         # 执行拆分
         groups = decision['groups']

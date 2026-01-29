@@ -68,12 +68,16 @@ class FedAMEClient:
         # 旧模型（用于防遗忘）
         self.old_router = None
         self.old_expert_pool = None
+        
+        # 专家到簇的映射（用于路由损失）
+        self.expert_to_cluster: Dict[int, int] = {}
     
     def setup_local_data(
         self,
         local_classes: List[int],
         local_experts: List[int],
-        class_to_expert: Dict[int, int]
+        class_to_expert: Dict[int, int],
+        expert_to_cluster: Optional[Dict[int, int]] = None
     ):
         """
         设置本地数据信息
@@ -82,12 +86,21 @@ class FedAMEClient:
             local_classes: 本地拥有的类别
             local_experts: 本地需要的专家
             class_to_expert: 类别到专家的映射
+            expert_to_cluster: 专家到簇的映射
         """
         self.local_classes = local_classes
         self.local_experts = local_experts
         
-        # 更新专家池的映射
+        # 保存专家到簇的映射
+        if expert_to_cluster is not None:
+            self.expert_to_cluster = expert_to_cluster
+        
+        # 更新专家池的映射（确保专家存在）
         for cls, exp in class_to_expert.items():
+            # 如果专家不存在，先创建并移动到正确设备
+            if str(exp) not in self.expert_pool.experts:
+                self.expert_pool.add_expert(exp)
+                self.expert_pool.experts[str(exp)].to(self.device)
             self.expert_pool.assign_class_to_expert(cls, exp)
         
         # 为本地类添加分布
@@ -221,12 +234,18 @@ class FedAMEClient:
                     dist = self.distribution_pool.get_distribution(cls)
                     residuals.append(dist.residual)
             
-            # 8. 计算损失
+            # 8. 将专家ID转换为簇ID（用于路由损失）
+            target_clusters = torch.tensor(
+                [self.expert_to_cluster.get(exp.item(), 0) for exp in target_experts],
+                device=self.device
+            )
+            
+            # 9. 计算损失
             losses = self.criterion(
                 cls_logits=cls_logits,
                 targets=labels,
                 routing_probs=routing_probs,
-                target_experts=target_experts,
+                target_experts=target_clusters,  # 使用簇ID而不是专家ID
                 features=projected,
                 all_anchors=self.class_anchors,
                 valid_classes=self.local_classes,
@@ -328,12 +347,14 @@ class FedAMEClient:
                 router_state[key] = value
         self.router.load_state_dict(router_state, strict=False)
         
-        # 加载专家
-        for exp_id in self.local_experts:
-            if exp_id in global_expert_states:
-                self.expert_pool.get_expert(exp_id).load_state_dict(
-                    global_expert_states[exp_id]
-                )
+        # 加载专家（先确保专家存在，再加载参数）
+        for exp_id, exp_state in global_expert_states.items():
+            # 如果专家不存在，先创建并移动到正确设备
+            if str(exp_id) not in self.expert_pool.experts:
+                self.expert_pool.add_expert(exp_id)
+                self.expert_pool.experts[str(exp_id)].to(self.device)
+            # 加载参数
+            self.expert_pool.get_expert(exp_id).load_state_dict(exp_state)
         
         # 加载分布参数
         if global_distribution_params:

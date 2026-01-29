@@ -149,7 +149,8 @@ def train_task(
         clients[k].setup_local_data(
             local_classes=local_classes,
             local_experts=client_config['local_experts'],
-            class_to_expert=client_config['class_to_expert']
+            class_to_expert=client_config['class_to_expert'],
+            expert_to_cluster=client_config['expert_to_cluster']
         )
         
         # 保存旧模型（用于防遗忘）
@@ -159,27 +160,56 @@ def train_task(
     # 4. 联邦训练
     all_metrics = []
     
+    # 预先创建测试集
+    test_classes = list(set(server.learned_classes + task_classes))
+    test_dataset = fed_data.get_cumulative_test_data(test_classes)
+    test_loader = create_data_loaders(
+        test_dataset,
+        batch_size=config.federated.local_batch_size * 2,
+        shuffle=False
+    )
+    
     for round_idx in range(config.training.num_rounds):
         round_metrics = {'round': round_idx + 1}
         client_updates = {}
         client_distribution_params = {}
         
         # 4.1 选择参与的客户端
-        active_clients = []
+        all_active_clients = []
         for k, (indices, local_classes) in client_data.items():
             if len(local_classes) > 0 and len(indices) > 0:
-                active_clients.append(k)
+                all_active_clients.append(k)
         
-        if len(active_clients) == 0:
+        if len(all_active_clients) == 0:
             print(f"Round {round_idx + 1}: No active clients")
             continue
         
+        # 按participation_rate随机选择客户端
+        num_selected = max(1, int(len(all_active_clients) * config.federated.participation_rate))
+        active_clients = random.sample(all_active_clients, num_selected)
+        
         # 4.2 客户端本地训练
+        client_losses = []
+        client_train_accs = []
+        client_sample_counts = {}  # 客户端总样本数
+        client_class_counts = {}   # 客户端每类样本数
+        
         for k in active_clients:
             indices = client_data[k][0]
+            local_classes = client_data[k][1]
+            
+            # 记录样本数量
+            client_sample_counts[k] = len(indices)
+            
+            # 统计每类样本数
+            train_subset = Subset(fed_data.train_dataset, indices)
+            class_counts = {}
+            for idx in indices:
+                _, label = fed_data.train_dataset[idx]
+                class_counts[label] = class_counts.get(label, 0) + 1
+            client_class_counts[k] = class_counts
             
             # 创建本地数据加载器
-            train_subset = Subset(fed_data.train_dataset, indices)
             train_loader = create_data_loaders(
                 train_subset,
                 batch_size=config.federated.local_batch_size,
@@ -195,10 +225,17 @@ def train_task(
             client_distribution_params[k] = clients[k].get_distribution_params()
             
             round_metrics[f'client_{k}_loss'] = metrics['loss']
-            round_metrics[f'client_{k}_acc'] = metrics['accuracy']
+            round_metrics[f'client_{k}_train_acc'] = metrics['accuracy']
+            client_losses.append(metrics['loss'])
+            client_train_accs.append(metrics['accuracy'])
         
-        # 4.3 服务端聚合
-        server.aggregate(client_updates, client_distribution_params)
+        # 4.3 服务端聚合（传入样本数量用于加权）
+        server.aggregate(
+            client_updates, 
+            client_distribution_params,
+            client_sample_counts=client_sample_counts,
+            client_class_counts=client_class_counts
+        )
         
         # 4.4 分发更新后的全局模型
         for k in active_clients:
@@ -210,23 +247,31 @@ def train_task(
                 client_config['distribution_params']
             )
         
-        # 4.5 评估
+        # 4.5 评估全局模型
+        eval_metrics = server.evaluate(test_loader)
+        round_metrics['global_test_acc'] = eval_metrics['accuracy']
+        
+        # 计算平均值
+        avg_loss = sum(client_losses) / len(client_losses)
+        avg_train_acc = sum(client_train_accs) / len(client_train_accs)
+        
+        # 打印日志
+        print(f"Round {round_idx + 1:3d}/{config.training.num_rounds} | "
+              f"Clients: {len(active_clients)}/{len(all_active_clients)} | "
+              f"Loss: {avg_loss:.4f} | "
+              f"Train: {avg_train_acc:.2f}% | "
+              f"Test: {eval_metrics['accuracy']:.2f}%", end="")
+        
+        # 定期打印详细的每类准确率
         if (round_idx + 1) % config.log_interval == 0:
-            # 创建测试集
-            test_dataset = fed_data.get_cumulative_test_data(
-                server.learned_classes + task_classes
-            )
-            test_loader = create_data_loaders(
-                test_dataset,
-                batch_size=config.federated.local_batch_size * 2,
-                shuffle=False
-            )
-            
-            eval_metrics = server.evaluate(test_loader)
-            round_metrics['test_acc'] = eval_metrics['accuracy']
-            
-            print(f"Round {round_idx + 1}/{config.training.num_rounds} | "
-                  f"Test Acc: {eval_metrics['accuracy']:.2f}%")
+            class_accs = []
+            for cls in test_classes:
+                key = f'class_{cls}_acc'
+                if key in eval_metrics:
+                    class_accs.append(f"{fed_data.class_names[cls]}:{eval_metrics[key]:.1f}%")
+            print(f"\n         Per-class: {', '.join(class_accs)}")
+        else:
+            print()  # 换行
         
         all_metrics.append(round_metrics)
     
@@ -243,9 +288,42 @@ def train_task(
     
     final_metrics = server.evaluate(test_loader)
     
-    print(f"\nTask {task_id + 1} Final Results:")
+    print(f"\n{'─'*60}")
+    print(f"Task {task_id + 1} Completed!")
+    print(f"{'─'*60}")
     print(f"  Overall Accuracy: {final_metrics['accuracy']:.2f}%")
-    print(f"  Classes learned so far: {server.learned_classes}")
+    print(f"  Learned classes: {[fed_data.class_names[c] for c in server.learned_classes]}")
+    
+    # 打印各任务类别的准确率
+    if task_id > 0:
+        # 计算旧任务的平均准确率（检测遗忘）
+        old_task_accs = []
+        for old_task_idx in range(task_id):
+            old_task_classes = config.incremental.tasks[old_task_idx]
+            task_acc = 0
+            for cls in old_task_classes:
+                key = f'class_{cls}_acc'
+                if key in final_metrics:
+                    task_acc += final_metrics[key]
+            task_acc /= len(old_task_classes)
+            old_task_accs.append(task_acc)
+            print(f"  Task {old_task_idx + 1} Acc (old): {task_acc:.2f}%")
+        
+        # 当前任务准确率
+        current_task_acc = 0
+        for cls in task_classes:
+            key = f'class_{cls}_acc'
+            if key in final_metrics:
+                current_task_acc += final_metrics[key]
+        current_task_acc /= len(task_classes)
+        print(f"  Task {task_id + 1} Acc (new): {current_task_acc:.2f}%")
+        
+        # 遗忘指标
+        if old_task_accs:
+            avg_old_acc = sum(old_task_accs) / len(old_task_accs)
+            print(f"  Avg Old Tasks Acc: {avg_old_acc:.2f}%")
+    
+    print(f"{'─'*60}\n")
     
     return {
         'task_id': task_id,
@@ -360,8 +438,29 @@ def main():
     
     final_metrics = server.evaluate(test_loader)
     
-    print(f"\nFinal Overall Accuracy: {final_metrics['accuracy']:.2f}%")
-    print(f"Total classes learned: {len(server.learned_classes)}")
+    print(f"\n📊 Final Results:")
+    print(f"   Overall Accuracy: {final_metrics['accuracy']:.2f}%")
+    print(f"   Total classes learned: {len(server.learned_classes)}")
+    
+    # 打印每个任务的最终准确率
+    print(f"\n📈 Per-Task Accuracy:")
+    for task_idx, task_cls in enumerate(config.incremental.tasks):
+        task_acc = 0
+        class_details = []
+        for cls in task_cls:
+            key = f'class_{cls}_acc'
+            if key in final_metrics:
+                task_acc += final_metrics[key]
+                class_details.append(f"{fed_data.class_names[cls]}:{final_metrics[key]:.1f}%")
+        task_acc /= len(task_cls)
+        print(f"   Task {task_idx + 1}: {task_acc:.2f}% ({', '.join(class_details)})")
+    
+    # 打印专家结构
+    print(f"\n🔧 Final Expert Structure:")
+    expert_info = server.global_expert_pool.get_expert_info()
+    for exp_id, info in expert_info.items():
+        class_names = [fed_data.class_names[c] for c in info['responsible_classes']]
+        print(f"   Expert {exp_id}: {class_names}")
     
     # 保存结果
     results = {
