@@ -162,12 +162,12 @@ class DistributionPool(nn.Module):
         # 类别分布字典
         self.distributions: Dict[int, ClassDistribution] = nn.ModuleDict()
         
-        # 全局锚点引用
-        self.class_anchors: Optional[torch.Tensor] = None
+        # 全局锚点引用 - 使用register_buffer初始化为None
+        self.register_buffer('class_anchors', None)
     
     def set_anchors(self, anchors: torch.Tensor):
         """设置类锚点"""
-        self.register_buffer('class_anchors', anchors)
+        self.class_anchors = anchors
     
     def add_class(self, class_id: int, anchor: Optional[torch.Tensor] = None):
         """

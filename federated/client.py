@@ -9,13 +9,13 @@ from torch.utils.data import DataLoader, Subset
 from typing import Dict, List, Optional, Tuple
 import copy
 
-from ..models import (
+from models import (
     create_backbone,
     AnchorBasedRouter,
     ExpertPool,
     DistributionPool
 )
-from ..losses import FedAMELoss
+from losses import FedAMELoss
 
 
 class FedAMEClient:

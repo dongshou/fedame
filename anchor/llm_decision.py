@@ -19,12 +19,13 @@ class LLMDecisionMaker:
     
     def __init__(
         self,
-        api_url: str = "https://api.deepseek.com/v1/chat/completions",
+        api_base: str = "https://api.deepseek.com/v1",
         api_key: Optional[str] = None,
         model: str = "deepseek-chat",
         use_real_llm: bool = False
     ):
-        self.api_url = api_url
+        self.api_base = api_base or os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
+        self.api_url = f"{self.api_base}/chat/completions"
         self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
         self.model = model
         self.use_real_llm = use_real_llm and self.api_key is not None

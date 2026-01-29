@@ -52,7 +52,13 @@ def create_clients(
             anchor_dim=config.model.anchor_dim,
             temperature=config.training.temperature_route
         )
-        router.load_state_dict(server.global_router.state_dict())
+        router.load_state_dict(server.global_router.state_dict(), strict=False)
+        # 设置锚点
+        router.set_class_anchors(server.class_anchors.clone())
+        router.set_cluster_anchors(
+            server.cluster_anchors.clone(),
+            server.global_router.cluster_to_expert
+        )
         
         # 创建专家池（从服务端复制初始参数）
         expert_pool = ExpertPool(

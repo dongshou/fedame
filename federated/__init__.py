@@ -1,2 +1,2 @@
-from .client import FedAMEClient
-from .server import FedAMEServer
+from federated.client import FedAMEClient
+from federated.server import FedAMEServer

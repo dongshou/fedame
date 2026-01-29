@@ -6,6 +6,21 @@ Federated Anchor-guided Mixture-of-Experts for Class-Incremental Learning
 import os
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
+from pathlib import Path
+
+def load_env():
+    """从.env文件加载环境变量"""
+    env_path = Path(__file__).parent / '.env'
+    if env_path.exists():
+        with open(env_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    os.environ.setdefault(key.strip(), value.strip())
+
+# 加载.env文件
+load_env()
 
 @dataclass
 class DataConfig:
@@ -107,10 +122,11 @@ class AnchorConfig:
     # CLIP模型
     clip_model: str = "openai/clip-vit-base-patch32"
     
-    # LLM API配置 (DeepSeek)
-    llm_api_url: str = "https://api.deepseek.com/v1/chat/completions"
+    # LLM API配置 (DeepSeek) - 从.env文件读取
+    llm_api_base: str = field(default_factory=lambda: os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1"))
+    llm_api_url: str = field(default_factory=lambda: os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1") + "/chat/completions")
     llm_model: str = "deepseek-chat"
-    llm_api_key: Optional[str] = None  # 从环境变量读取
+    llm_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("DEEPSEEK_API_KEY"))
     
     # 是否使用真实LLM（否则使用规则决策）
     use_real_llm: bool = False
@@ -135,8 +151,4 @@ class Config:
 def get_config() -> Config:
     """获取配置"""
     config = Config()
-    
-    # 从环境变量读取API密钥
-    config.anchor.llm_api_key = os.environ.get("DEEPSEEK_API_KEY", None)
-    
     return config

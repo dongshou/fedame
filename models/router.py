@@ -86,10 +86,10 @@ class AnchorBasedRouter(nn.Module):
         self.temperature = temperature
         self.anchor_dim = anchor_dim
         
-        # 簇锚点（用于路由）
-        self.cluster_anchors: Optional[torch.Tensor] = None
-        # 类锚点（用于分类）
-        self.class_anchors: Optional[torch.Tensor] = None
+        # 簇锚点（用于路由）- 使用register_buffer初始化为None
+        self.register_buffer('cluster_anchors', None)
+        # 类锚点（用于分类）- 使用register_buffer初始化为None
+        self.register_buffer('class_anchors', None)
         # 簇到专家的映射
         self.cluster_to_expert: Optional[dict] = None
     
@@ -105,7 +105,7 @@ class AnchorBasedRouter(nn.Module):
             anchors: 簇锚点 [num_clusters, anchor_dim]
             cluster_to_expert: 簇ID到专家ID的映射
         """
-        self.register_buffer('cluster_anchors', anchors)
+        self.cluster_anchors = anchors
         self.cluster_to_expert = cluster_to_expert
     
     def set_class_anchors(self, anchors: torch.Tensor):
@@ -115,7 +115,7 @@ class AnchorBasedRouter(nn.Module):
         Args:
             anchors: 类锚点 [num_classes, anchor_dim]
         """
-        self.register_buffer('class_anchors', anchors)
+        self.class_anchors = anchors
     
     def compute_routing_logits(
         self,

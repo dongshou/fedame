@@ -1,2 +1,2 @@
-from .clip_anchor import AnchorGenerator, SimpleAnchorGenerator, create_anchor_generator
-from .llm_decision import LLMDecisionMaker, ExpertManager
+from anchor.clip_anchor import AnchorGenerator, SimpleAnchorGenerator, create_anchor_generator
+from anchor.llm_decision import LLMDecisionMaker, ExpertManager

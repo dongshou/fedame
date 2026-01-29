@@ -8,14 +8,14 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 import copy
 
-from ..models import (
+from models import (
     create_backbone,
     AnchorBasedRouter,
     ExpertPool,
     DistributionPool,
     aggregate_distributions
 )
-from ..anchor import (
+from anchor import (
     create_anchor_generator,
     LLMDecisionMaker,
     ExpertManager
