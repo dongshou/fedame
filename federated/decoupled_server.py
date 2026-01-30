@@ -227,7 +227,8 @@ class DecoupledServer:
         self,
         client_router_updates: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
         client_prototype_updates: Dict[int, Dict[int, Dict]],
-        client_train_stats: Dict[int, Dict[int, Dict]]
+        client_train_stats: Dict[int, Dict[int, Dict]],
+        client_expert_updates: Optional[Dict[int, Dict[int, Dict[str, torch.Tensor]]]] = None
     ):
         """
         聚合客户端更新
@@ -236,6 +237,7 @@ class DecoupledServer:
             client_router_updates: {client_id: {class_id: {param_name: param_value}}}
             client_prototype_updates: {client_id: {class_id: {'prototype': tensor, 'count': int}}}
             client_train_stats: {client_id: {class_id: {'pos_count': int, 'neg_count': int}}}
+            client_expert_updates: {client_id: {expert_id: {param_name: param_value}}}
         """
         # 1. 聚合每个Router（按正负样本数量加权）
         self._aggregate_routers(client_router_updates, client_train_stats)
@@ -243,8 +245,65 @@ class DecoupledServer:
         # 2. 聚合视觉原型
         self._aggregate_prototypes(client_prototype_updates)
         
-        # 3. 聚合专家（如果需要的话）
-        # 这里暂时不聚合专家，因为专家是按类别分配的
+        # 3. 聚合专家
+        if client_expert_updates is not None:
+            self._aggregate_experts(client_expert_updates, client_train_stats)
+    
+    def _aggregate_experts(
+        self,
+        client_expert_updates: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
+        client_train_stats: Dict[int, Dict[int, Dict]]
+    ):
+        """
+        聚合所有Expert
+        
+        按每个Expert负责的类别的样本数量加权
+        """
+        if len(client_expert_updates) == 0:
+            return
+        
+        # 收集每个Expert的更新
+        expert_updates_by_id: Dict[int, List[Tuple[Dict[str, torch.Tensor], float]]] = {}
+        
+        for client_id, expert_updates in client_expert_updates.items():
+            for expert_id, params in expert_updates.items():
+                if expert_id not in expert_updates_by_id:
+                    expert_updates_by_id[expert_id] = []
+                
+                # 计算该客户端对该Expert负责的类别的样本数
+                responsible_classes = self.global_expert_pool.get_expert(expert_id).responsible_classes
+                weight = 0
+                for cls in responsible_classes:
+                    stats = client_train_stats.get(client_id, {}).get(cls, {})
+                    weight += stats.get('pos_count', 0)
+                
+                if weight > 0:
+                    expert_updates_by_id[expert_id].append((params, weight))
+        
+        # 对每个Expert进行加权聚合
+        for expert_id, updates_with_weights in expert_updates_by_id.items():
+            if len(updates_with_weights) == 0:
+                continue
+            
+            total_weight = sum(w for _, w in updates_with_weights)
+            if total_weight == 0:
+                continue
+            
+            # 聚合参数
+            aggregated_params = {}
+            for param_name in updates_with_weights[0][0].keys():
+                aggregated_params[param_name] = sum(
+                    (w / total_weight) * params[param_name].to(self.device)
+                    for params, w in updates_with_weights
+                )
+            
+            # 更新全局Expert
+            expert = self.global_expert_pool.get_expert(expert_id)
+            state_dict = expert.state_dict()
+            for name, value in aggregated_params.items():
+                if name in state_dict:
+                    state_dict[name] = value
+            expert.load_state_dict(state_dict)
     
     def _aggregate_routers(
         self,

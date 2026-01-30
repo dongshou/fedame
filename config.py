@@ -113,7 +113,7 @@ class IncrementalConfig:
 @dataclass
 class TrainingConfig:
     """训练配置"""
-    num_rounds: int = 100  # 每个任务的联邦轮数
+    num_rounds: int = 1000  # 每个任务的联邦轮数
     learning_rate: float = 0.01
     weight_decay: float = 1e-4
     
