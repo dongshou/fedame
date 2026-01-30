@@ -213,28 +213,36 @@ class DecoupledClient:
     def train_routers(
         self,
         train_loader: DataLoader,
-        num_epochs: int = 5
+        num_epochs: int = 5,
+        expert_loss_weight: float = 1.0
     ) -> Dict[str, float]:
         """
-        训练所有Router
+        训练所有Router和Expert
         
         核心逻辑：
-        - 对于每个Router_i：
+        - Router训练：对比学习
           - 正样本：本地类i的真实特征（如果有），否则用全局原型
           - 负样本：本地所有非i类的特征
           - 使用Hard Negative Mining
+        - Expert训练：分类损失
+          - 用真实标签对应的Expert处理特征
+          - 计算交叉熵损失
         
         Args:
             train_loader: 训练数据加载器
             num_epochs: 本地训练轮数
+            expert_loss_weight: Expert分类损失的权重
         
         Returns:
             metrics: 训练指标
         """
         self._init_optimizer()
         self.router_pool.train()
+        self.expert_pool.train()  # Expert也需要训练
         
         total_loss = 0.0
+        total_router_loss = 0.0
+        total_expert_loss = 0.0
         total_batches = 0
         
         # 初始化训练统计
@@ -258,8 +266,8 @@ class DecoupledClient:
                     if mask.sum() > 0:
                         batch_class_features[cls] = features[mask]
                 
-                # 3. 训练每个Router
-                batch_loss = torch.tensor(0.0, device=self.device)
+                # 3. 训练每个Router（对比损失）
+                router_loss = torch.tensor(0.0, device=self.device)
                 
                 for class_id in range(self.num_classes):
                     router = self.router_pool.get_router(class_id)
@@ -291,7 +299,7 @@ class DecoupledClient:
                     else:
                         neg_features = None
                     
-                    # 计算损失
+                    # 计算Router对比损失
                     loss, _ = self.contrastive_loss(
                         router=router,
                         anchor=anchor,
@@ -300,24 +308,50 @@ class DecoupledClient:
                         pos_prototype=pos_prototype
                     )
                     
-                    batch_loss = batch_loss + loss
+                    router_loss = router_loss + loss
                 
-                # 4. 反向传播
+                # 4. 计算Expert分类损失
+                # 关键：用真实标签对应的Expert，而不是Router预测的Expert
+                # 这样Expert可以正确学习，不受Router错误的影响
+                true_expert_ids = torch.tensor(
+                    [self.class_to_expert.get(l.item(), 0) for l in labels],
+                    device=self.device
+                )
+                
+                # Expert处理特征并计算分类logits
+                cls_logits, _ = self.expert_pool(
+                    features, true_expert_ids, self.class_anchors
+                )
+                expert_loss = F.cross_entropy(cls_logits, labels)
+                
+                # 5. 总损失
+                batch_loss = router_loss + expert_loss_weight * expert_loss
+                
+                # 6. 反向传播
                 self.optimizer.zero_grad()
                 batch_loss.backward()
+                
+                # 对Router和Expert都进行梯度裁剪
                 torch.nn.utils.clip_grad_norm_(self.router_pool.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.expert_pool.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 
                 epoch_loss += batch_loss.item()
+                total_router_loss += router_loss.item()
+                total_expert_loss += expert_loss.item()
                 total_batches += 1
             
             total_loss += epoch_loss
         
         # 计算平均损失
         avg_loss = total_loss / max(total_batches, 1)
+        avg_router_loss = total_router_loss / max(total_batches, 1)
+        avg_expert_loss = total_expert_loss / max(total_batches, 1)
         
         return {
             'loss': avg_loss,
+            'router_loss': avg_router_loss,
+            'expert_loss': avg_expert_loss,
             'num_epochs': num_epochs,
             'num_batches': total_batches
         }
@@ -352,6 +386,22 @@ class DecoupledClient:
     def get_train_stats(self) -> Dict[int, Dict]:
         """获取训练统计信息"""
         return self.train_stats
+    
+    def get_expert_updates(self) -> Dict[int, Dict[str, torch.Tensor]]:
+        """
+        获取本地Expert的参数更新
+        
+        Returns:
+            updates: {expert_id: state_dict}
+        """
+        updates = {}
+        for exp_id in self.local_experts:
+            expert = self.expert_pool.get_expert(exp_id)
+            updates[exp_id] = {
+                name: param.data.clone().cpu()
+                for name, param in expert.named_parameters()
+            }
+        return updates
     
     def load_global_routers(
         self,

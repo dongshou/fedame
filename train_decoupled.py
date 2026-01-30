@@ -223,6 +223,7 @@ def train_task(
         client_router_updates = {}
         client_prototype_updates = {}
         client_train_stats = {}
+        client_expert_updates = {}  # 新增：Expert更新
         client_losses = []
         
         for k in active_clients:
@@ -232,6 +233,7 @@ def train_task(
             # 加载最新的全局模型
             client_config = server.get_client_config(k, local_classes)
             clients[k].load_global_routers(client_config['router_params'])
+            clients[k].load_global_experts(client_config['expert_states'])  # 新增：加载Expert
             clients[k].set_global_prototypes(
                 client_config['prototype_info']['prototypes'],
                 client_config['prototype_info']['counts']
@@ -245,25 +247,30 @@ def train_task(
                 shuffle=True
             )
             
-            # 本地训练
+            # 本地训练（同时训练Router和Expert）
             metrics = clients[k].train_routers(
                 train_loader,
-                num_epochs=config.federated.local_epochs
+                num_epochs=config.federated.local_epochs,
+                expert_loss_weight=1.0  # Expert分类损失权重
             )
             
             # 收集更新
             client_router_updates[k] = clients[k].get_router_updates()
             client_prototype_updates[k] = clients[k].get_prototype_updates()
             client_train_stats[k] = clients[k].get_train_stats()
+            client_expert_updates[k] = clients[k].get_expert_updates()  # 新增：Expert更新
             
             client_losses.append(metrics['loss'])
             round_metrics[f'client_{k}_loss'] = metrics['loss']
+            round_metrics[f'client_{k}_router_loss'] = metrics.get('router_loss', 0)
+            round_metrics[f'client_{k}_expert_loss'] = metrics.get('expert_loss', 0)
         
-        # 4.3 服务端聚合
+        # 4.3 服务端聚合（包含Expert聚合）
         server.aggregate(
             client_router_updates,
             client_prototype_updates,
-            client_train_stats
+            client_train_stats,
+            client_expert_updates  # 新增：Expert更新
         )
         
         # 4.4 评估
