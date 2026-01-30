@@ -189,8 +189,21 @@ class ExpertPool(nn.Module):
         x: torch.Tensor,
         expert_ids: torch.Tensor,
         class_anchors: torch.Tensor,
-        temperature: float = 0.1
+        temperature: float = 0.1,
+        use_mask: bool = False  # 新增参数：是否使用mask机制
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: 输入特征 [B, input_dim]
+            expert_ids: 每个样本对应的专家ID [B]
+            class_anchors: 类锚点 [num_classes, anchor_dim]
+            temperature: 温度系数
+            use_mask: 是否使用mask机制（False=每个专家输出所有类的logits）
+        
+        Returns:
+            all_logits: 分类logits [B, num_classes]
+            all_features: 专家输出特征 [B, output_dim]
+        """
         batch_size = x.size(0)
         num_classes = class_anchors.size(0)
         device = x.device
@@ -206,16 +219,19 @@ class ExpertPool(nn.Module):
             expert_feat = expert(x)  # [B, output_dim]
             all_expert_features.append(expert_feat)
             
+            # 计算与所有类锚点的相似度
             sim = torch.mm(expert_feat, class_anchors_norm.t()) / temperature
             
-            responsible_classes = expert.responsible_classes
-            mask = torch.zeros(num_classes, device=device)
-            if len(responsible_classes) > 0:
-                for cls in responsible_classes:
-                    mask[cls] = 1.0
+            # 是否使用mask机制
+            if use_mask:
+                responsible_classes = expert.responsible_classes
+                mask = torch.zeros(num_classes, device=device)
+                if len(responsible_classes) > 0:
+                    for cls in responsible_classes:
+                        mask[cls] = 1.0
+                sim = sim + (1 - mask) * (-1e9)
             
-            masked_sim = sim + (1 - mask) * (-1e9)
-            all_expert_logits.append(masked_sim)
+            all_expert_logits.append(sim)
         
         # 堆叠: [E, B, ...]
         stacked_features = torch.stack(all_expert_features, dim=0)  # [E, B, output_dim]

@@ -20,20 +20,46 @@ class Router(nn.Module):
         input_dim: int = 512,
         hidden_dim: int = 256,
         output_dim: int = 512,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        num_layers: int = 5,  # 默认5层
+        use_residual: bool = True  # 使用残差连接
     ):
         super().__init__()
         
-        self.projector = nn.Sequential(
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.use_residual = use_residual
+        
+        # 输入投影
+        self.input_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        # 中间层（带残差连接）
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers - 2):
+            self.layers.append(
+                ResidualBlock(hidden_dim, dropout) if use_residual 
+                else nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout)
+                )
+            )
+        
+        # 输出投影
+        self.output_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, output_dim)
         )
-        
-        self.input_dim = input_dim
-        self.output_dim = output_dim
         
         # 初始化
         self._init_weights()
@@ -54,10 +80,39 @@ class Router(nn.Module):
         Returns:
             projected: 投影后的特征 [B, output_dim]
         """
-        projected = self.projector(x)
-        # L2归一化，便于计算余弦相似度
+        # 输入投影
+        h = self.input_proj(x)
+        
+        # 中间层
+        for layer in self.layers:
+            h = layer(h)
+        
+        # 输出投影
+        projected = self.output_proj(h)
+        
+        # L2归一化
         projected = F.normalize(projected, p=2, dim=-1)
         return projected
+
+
+class ResidualBlock(nn.Module):
+    """残差块"""
+    
+    def __init__(self, dim: int, dropout: float = 0.1):
+        super().__init__()
+        
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.LayerNorm(dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 2, dim),
+            nn.LayerNorm(dim),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(x)
 
 
 class AnchorBasedRouter(nn.Module):
@@ -72,7 +127,9 @@ class AnchorBasedRouter(nn.Module):
         hidden_dim: int = 256,
         anchor_dim: int = 512,
         temperature: float = 0.1,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        num_layers: int = 5,  # 默认5层
+        use_residual: bool = True  # 使用残差连接
     ):
         super().__init__()
         
@@ -80,7 +137,9 @@ class AnchorBasedRouter(nn.Module):
             input_dim=input_dim,
             hidden_dim=hidden_dim,
             output_dim=anchor_dim,
-            dropout=dropout
+            dropout=dropout,
+            num_layers=num_layers,
+            use_residual=use_residual
         )
         
         self.temperature = temperature

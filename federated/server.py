@@ -82,10 +82,17 @@ class FedAMEServer:
             self.class_names
         ).to(self.device)
         
-        # 生成簇锚点
+        # 生成簇锚点（复用类锚点如果名称相同）
         self.cluster_anchors = self.anchor_generator.generate_anchors(
             self.cluster_names
         ).to(self.device)
+        
+        # 验证正交性（如果支持）
+        if hasattr(self.anchor_generator, 'verify_orthogonality'):
+            ortho_info = self.anchor_generator.verify_orthogonality()
+            print(f"   📐 Anchor orthogonality: max_sim={ortho_info['max_similarity']:.4f}, "
+                  f"mean_sim={ortho_info['mean_similarity']:.4f}, "
+                  f"num_anchors={ortho_info['num_anchors']}")
     
     def _init_global_model(self, config: Dict):
         """初始化全局模型"""
@@ -96,12 +103,15 @@ class FedAMEServer:
             frozen=True
         ).to(self.device)
         
-        # 路由层
+        # 路由层（更复杂的网络）
         self.global_router = AnchorBasedRouter(
             input_dim=config.get('feature_dim', 512),
-            hidden_dim=config.get('router_hidden_dim', 256),
+            hidden_dim=config.get('router_hidden_dim', 512),
             anchor_dim=config.get('anchor_dim', 512),
-            temperature=config.get('temperature_route', 0.1)
+            temperature=config.get('temperature_route', 0.1),
+            dropout=config.get('router_dropout', 0.1),
+            num_layers=config.get('router_num_layers', 5),
+            use_residual=config.get('router_use_residual', True)
         ).to(self.device)
         
         # 设置锚点
@@ -119,12 +129,13 @@ class FedAMEServer:
             num_initial_experts=len(self.cluster_names)
         ).to(self.device)
         
-        # 全局分布池
+        # 全局分布池（使用改进参数防止过拟合）
         self.global_distribution_pool = DistributionPool(
-            dim=config.get('feature_dim', 512)  # backbone 输出维度
-        )
-        self.global_distribution_pool = DistributionPool(
-            dim=config.get('feature_dim', 512)  # backbone 输出维度
+            dim=config.get('feature_dim', 512),
+            init_std=config.get('distribution_init_std', 0.5),
+            min_std=config.get('distribution_min_std', 0.1),
+            max_std=config.get('distribution_max_std', 2.0),
+            noise_scale=config.get('distribution_noise_scale', 0.1)
         )
     
     def _sync_expert_assignments(self):
@@ -160,9 +171,8 @@ class FedAMEServer:
             # 同步到专家池
             self.global_expert_pool.assign_class_to_expert(cls, expert_id)
             
-            # 添加到分布池
-            if not self.global_distribution_pool.has_class(cls):
-                self.global_distribution_pool.add_class(cls)
+            # 注意：不在这里初始化分布！
+            # 分布应该通过客户端训练后聚合获得，而不是用空值初始化
         
         # 检查是否需要拆分专家
         for exp_id in list(self.expert_manager.expert_info.keys()):
@@ -236,22 +246,18 @@ class FedAMEServer:
             expert = self.global_expert_pool.get_expert(exp_id)
             expert_states[exp_id] = expert.state_dict()
         
-        # 获取所有已学习类的分布参数（用于伪样本训练）
+        # 获取所有已聚合的有效分布（sample_count > 0，用于伪样本训练）
         distribution_params = {}
-        for cls in self.learned_classes:
-            if self.global_distribution_pool.has_class(cls):
-                distribution_params[cls] = (
-                    self.global_distribution_pool.get_distribution(cls).get_params()
-                )
+        for cls in self.global_distribution_pool.class_list:
+            dist = self.global_distribution_pool.get_distribution(cls)
+            # 只分发有真实样本支持的分布
+            if dist.sample_count.item() > 0:
+                distribution_params[cls] = dist.get_params()
         
         return {
             'client_id': client_id,
             'local_classes': client_classes,
             'local_experts': list(needed_experts),
-            # 'class_to_expert': {
-            #     cls: self.global_expert_pool.get_expert_for_class(cls)
-            #     for cls in self.learned_classes  # 所有已学习的类
-            # },
             'class_to_expert': self.global_expert_pool.class_to_expert.copy(),
             'expert_to_cluster': self.get_expert_to_cluster(),
             'router_state': self.global_router.state_dict(),
@@ -409,23 +415,35 @@ class FedAMEServer:
         self,
         client_distribution_params: Dict[int, Dict[int, Dict]]
     ):
-        """聚合分布参数"""
+        """
+        聚合分布参数
+        关键：让之前的全局分布也参与聚合，避免被新客户端覆盖
+        """
         if len(client_distribution_params) == 0:
             return
         
-        # 转换格式
+        # 1. 收集客户端上传的分布
         params_list = list(client_distribution_params.values())
         
-        # 聚合
+        # 2. 把全局分布池中已有的分布也加入聚合（作为"历史知识"）
+        global_existing_params = {}
+        for cls in self.global_distribution_pool.class_list:
+            dist = self.global_distribution_pool.get_distribution(cls)
+            if dist.sample_count.item() > 0:
+                global_existing_params[cls] = dist.get_params()
+        
+        if len(global_existing_params) > 0:
+            params_list.append(global_existing_params)
+        
+        # 3. 聚合（加权平均，权重基于 sample_count）
         global_params = aggregate_distributions(
             params_list,
             dim=self.global_distribution_pool.dim
         )
         
-        # 更新全局分布
+        # 4. 更新全局分布
         for cls, params in global_params.items():
             if not self.global_distribution_pool.has_class(cls):
-                # 用聚合后的 mean 初始化
                 self.global_distribution_pool.add_class(cls, init_mean=params['mean'])
             self.global_distribution_pool.set_class_params(cls, params)
     

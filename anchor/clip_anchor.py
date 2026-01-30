@@ -222,44 +222,95 @@ class AnchorGenerator:
 class SimpleAnchorGenerator:
     """
     简化版锚点生成器
-    使用预定义的随机向量，确保类别间有区分度
+    支持正交初始化，确保类别锚点之间正交（相似度=0）
     """
     
     def __init__(
         self,
         dim: int = 512,
-        seed: int = 42
+        seed: int = 42,
+        orthogonal: bool = True  # 是否使用正交初始化
     ):
         self.dim = dim
         self.seed = seed
+        self.orthogonal = orthogonal
         self.anchor_cache = {}
+        self._orthogonal_basis = None  # 缓存正交基
+        self._basis_names = []  # 记录使用正交基的名称顺序
+    
+    def _generate_orthogonal_basis(self, num_vectors: int) -> torch.Tensor:
+        """
+        生成正交基
+        使用QR分解确保向量两两正交
+        """
+        torch.manual_seed(self.seed)
         
-        # 设置随机种子保证可复现
-        torch.manual_seed(seed)
+        # 生成随机矩阵
+        if num_vectors <= self.dim:
+            # 可以生成完全正交的向量
+            random_matrix = torch.randn(self.dim, num_vectors)
+            q, r = torch.linalg.qr(random_matrix)
+            basis = q[:, :num_vectors].t()  # [num_vectors, dim]
+        else:
+            # 向量数超过维度，无法完全正交，使用随机向量
+            basis = torch.randn(num_vectors, self.dim)
+            basis = F.normalize(basis, p=2, dim=-1)
+        
+        return basis
+    
+    def _generate_single_anchor(self, name: str) -> torch.Tensor:
+        """为单个名称生成锚点（使用名称的hash确保确定性）"""
+        if name in self.anchor_cache:
+            return self.anchor_cache[name]
+        
+        # 使用名称的hash作为种子，确保相同名称总是生成相同向量
+        name_seed = hash(name) % (2**32)
+        gen = torch.Generator()
+        gen.manual_seed(name_seed)
+        
+        anchor = torch.randn(self.dim, generator=gen)
+        anchor = F.normalize(anchor, p=2, dim=-1)
+        
+        self.anchor_cache[name] = anchor
+        return anchor
     
     def generate_anchors(
         self,
-        class_names: List[str]
+        class_names: List[str],
+        force_orthogonal: bool = None
     ) -> torch.Tensor:
         """
-        为类别生成正交化的锚点
+        为类别生成锚点
+        
+        Args:
+            class_names: 类别名称列表
+            force_orthogonal: 是否强制正交（None则使用默认设置）
+        
+        Returns:
+            anchors: [num_classes, dim] 锚点矩阵
         """
-        num_classes = len(class_names)
+        use_orthogonal = force_orthogonal if force_orthogonal is not None else self.orthogonal
         
-        # 生成随机矩阵
-        anchors = torch.randn(num_classes, self.dim)
-        
-        # QR分解获得正交基（如果维度足够）
-        if num_classes <= self.dim:
-            q, r = torch.linalg.qr(anchors.t())
-            anchors = q.t()[:num_classes]
-        
-        # L2归一化
-        anchors = F.normalize(anchors, p=2, dim=-1)
-        
-        # 缓存
-        for i, name in enumerate(class_names):
-            self.anchor_cache[name] = anchors[i]
+        if use_orthogonal:
+            # 检查是否所有名称都已在正交基中
+            all_cached = all(name in self.anchor_cache for name in class_names)
+            
+            if not all_cached:
+                # 生成新的正交基
+                num_classes = len(class_names)
+                basis = self._generate_orthogonal_basis(num_classes)
+                
+                # 缓存
+                for i, name in enumerate(class_names):
+                    if name not in self.anchor_cache:
+                        self.anchor_cache[name] = basis[i]
+                        self._basis_names.append(name)
+            
+            # 从缓存获取
+            anchors = torch.stack([self.anchor_cache[name] for name in class_names], dim=0)
+        else:
+            # 非正交模式：每个名称独立生成
+            anchors = torch.stack([self._generate_single_anchor(name) for name in class_names], dim=0)
         
         return anchors
     
@@ -267,12 +318,33 @@ class SimpleAnchorGenerator:
         self,
         cluster_names: List[str]
     ) -> torch.Tensor:
-        """为簇生成锚点"""
+        """为簇生成锚点（复用类锚点如果名称相同）"""
         return self.generate_anchors(cluster_names)
     
     def get_anchor(self, name: str) -> torch.Tensor:
         """获取缓存的锚点"""
         return self.anchor_cache.get(name)
+    
+    def verify_orthogonality(self) -> Dict[str, float]:
+        """验证锚点的正交性"""
+        if len(self.anchor_cache) < 2:
+            return {'max_similarity': 0.0, 'mean_similarity': 0.0}
+        
+        anchors = torch.stack(list(self.anchor_cache.values()), dim=0)
+        anchors = F.normalize(anchors, p=2, dim=-1)
+        
+        # 计算相似度矩阵
+        sim_matrix = torch.mm(anchors, anchors.t())
+        
+        # 去掉对角线
+        mask = ~torch.eye(len(anchors), dtype=torch.bool)
+        off_diag = sim_matrix[mask]
+        
+        return {
+            'max_similarity': off_diag.abs().max().item(),
+            'mean_similarity': off_diag.abs().mean().item(),
+            'num_anchors': len(anchors)
+        }
     
     @property
     def anchor_dim(self) -> int:
@@ -284,7 +356,8 @@ def create_anchor_generator(
     clip_model: str = "openai/clip-vit-base-patch32",
     device: str = "cuda",
     anchor_dim: int = 512,
-    seed: int = 42
+    seed: int = 42,
+    orthogonal: bool = True  # 默认使用正交初始化
 ):
     """
     创建锚点生成器
@@ -295,6 +368,7 @@ def create_anchor_generator(
         device: 设备
         anchor_dim: 锚点维度（仅用于简化版）
         seed: 随机种子（仅用于简化版）
+        orthogonal: 是否使用正交初始化（仅用于简化版）
     """
     if use_clip:
         return AnchorGenerator(
@@ -304,7 +378,8 @@ def create_anchor_generator(
     else:
         return SimpleAnchorGenerator(
             dim=anchor_dim,
-            seed=seed
+            seed=seed,
+            orthogonal=orthogonal
         )
 
 
@@ -316,40 +391,44 @@ if __name__ == "__main__":
         "dog", "frog", "horse", "ship", "truck"
     ]
     
-    # 语义簇
-    clusters = {
-        "animals": ["bird", "cat", "deer", "dog", "frog", "horse"],
-        "vehicles": ["airplane", "automobile", "ship", "truck"]
-    }
+    print("=" * 60)
+    print("Testing Orthogonal Anchor Generator")
+    print("=" * 60)
     
-    print("=" * 50)
-    print("Testing Anchor Generator")
-    print("=" * 50)
-    
-    # 使用简化版生成器（不需要下载CLIP）
-    generator = create_anchor_generator(use_clip=False, anchor_dim=512)
-    
-    # 生成类锚点
+    # 测试正交初始化
+    print("\n[1] Orthogonal initialization (default):")
+    generator = create_anchor_generator(use_clip=False, anchor_dim=512, orthogonal=True)
     class_anchors = generator.generate_anchors(class_names)
-    print(f"\nClass anchors shape: {class_anchors.shape}")
     
-    # 生成簇锚点
-    cluster_anchors = generator.generate_cluster_anchors(list(clusters.keys()))
-    print(f"Cluster anchors shape: {cluster_anchors.shape}")
+    # 验证正交性
+    ortho_info = generator.verify_orthogonality()
+    print(f"    Max similarity: {ortho_info['max_similarity']:.6f} (should be ~0)")
+    print(f"    Mean similarity: {ortho_info['mean_similarity']:.6f} (should be ~0)")
     
-    # 计算类别间相似度
-    print("\nClass similarity matrix (first 5 classes):")
-    sim_matrix = torch.mm(class_anchors[:5], class_anchors[:5].t())
-    print(sim_matrix)
+    # 打印相似度矩阵
+    sim_matrix = torch.mm(class_anchors, class_anchors.t())
+    print(f"\n    Similarity matrix (diagonal should be 1, others ~0):")
+    print(f"    Diagonal values: {sim_matrix.diag()}")
+    print(f"    Off-diagonal max: {(sim_matrix - torch.eye(10)).abs().max():.6f}")
     
-    # 测试CLIP版本（如果可用）
-    print("\n" + "=" * 50)
-    print("Testing CLIP Anchor Generator (if available)")
-    print("=" * 50)
+    # 测试非正交初始化
+    print("\n[2] Random initialization (non-orthogonal):")
+    generator_random = create_anchor_generator(use_clip=False, anchor_dim=512, orthogonal=False)
+    class_anchors_random = generator_random.generate_anchors(class_names)
     
-    try:
-        clip_generator = create_anchor_generator(use_clip=True, device="cpu")
-        clip_class_anchors = clip_generator.generate_class_anchors(class_names[:3])
-        print(f"CLIP class anchors shape: {clip_class_anchors.shape}")
-    except Exception as e:
-        print(f"CLIP not available: {e}")
+    ortho_info_random = generator_random.verify_orthogonality()
+    print(f"    Max similarity: {ortho_info_random['max_similarity']:.6f}")
+    print(f"    Mean similarity: {ortho_info_random['mean_similarity']:.6f}")
+    
+    # 测试簇锚点复用
+    print("\n[3] Cluster anchors (same name = same anchor):")
+    cluster_names = class_names  # 每个类一个簇
+    cluster_anchors = generator.generate_anchors(cluster_names)
+    
+    # 验证类锚点和簇锚点一致
+    diff = (class_anchors - cluster_anchors).abs().max()
+    print(f"    Class anchors == Cluster anchors: {diff < 1e-6}")
+    
+    print("\n" + "=" * 60)
+    print("✅ Orthogonal anchors ready for easier routing!")
+    print("=" * 60)

@@ -94,7 +94,10 @@ def create_clients(
             input_dim=config.model.feature_dim,
             hidden_dim=config.model.router_hidden_dim,
             anchor_dim=config.model.anchor_dim,
-            temperature=config.training.temperature_route
+            temperature=config.training.temperature_route,
+            dropout=config.model.router_dropout,
+            num_layers=config.model.router_num_layers,
+            use_residual=config.model.router_use_residual
         )
         router.load_state_dict(server.global_router.state_dict(), strict=False)
         # 设置锚点
@@ -116,9 +119,13 @@ def create_clients(
                 server.global_expert_pool.experts[exp_id].state_dict()
             )
         
-        # 创建分布池
+        # 创建分布池（使用改进参数防止过拟合）
         distribution_pool = DistributionPool(
-            dim=config.model.feature_dim  # backbone 输出维度，512
+            dim=config.model.feature_dim,  # backbone 输出维度，512
+            init_std=config.model.distribution_init_std,
+            min_std=config.model.distribution_min_std,
+            max_std=config.model.distribution_max_std,
+            noise_scale=config.model.distribution_noise_scale
         )
         
         # 创建客户端
@@ -238,9 +245,16 @@ def train_task(
             print(f"Round {round_idx + 1}: No active clients")
             continue
         
-        # 按participation_rate随机选择客户端
-        num_selected = max(1, int(len(all_active_clients) * config.federated.participation_rate))
+        # 按participation_rate随机选择客户端（基于总客户端数量）
+        num_to_select = max(1, int(config.federated.num_clients * config.federated.participation_rate))
+        # 确保不超过实际活跃客户端数量
+        num_selected = min(num_to_select, len(all_active_clients))
         active_clients = random.sample(all_active_clients, num_selected)
+        
+        # 第一轮打印客户端选择信息
+        if round_idx == 0:
+            print(f"   📊 Client selection: {num_selected}/{len(all_active_clients)} active "
+                  f"(target: {num_to_select} = {config.federated.num_clients} × {config.federated.participation_rate})")
         
         # 4.2 客户端本地训练
         client_losses = []
@@ -251,6 +265,14 @@ def train_task(
         for k in active_clients:
             indices = client_data[k][0]
             local_classes = client_data[k][1]
+            
+            # 训练前加载最新的全局模型（确保获取到聚合后的分布）
+            client_config = server.get_client_config(k, local_classes)
+            clients[k].load_global_model(
+                client_config['router_state'],
+                client_config['expert_states'],
+                client_config['distribution_params']
+            )
             
             # 记录样本数量
             client_sample_counts[k] = len(indices)
@@ -272,13 +294,13 @@ def train_task(
             
             # 本地训练（3阶段）
             # 阶段1: 训练路由器
-            for epoch in range(config.federated.local_epochs):
+            for epoch in range(config.federated.local_epochs*3):
                 router_metrics = clients[k].train_router_only(
                     train_loader,
                     num_pseudo_samples=50,
                     lambda_pseudo=0.2
                 )
-            print(k)
+            # print(k)
             print('router', router_metrics)
             # 阶段2: 训练专家
             for epoch in range(config.federated.local_epochs):
@@ -286,14 +308,14 @@ def train_task(
                     train_loader,
                     old_classes
                 )
-            print('expert', expert_metrics)
+            # print('expert', expert_metrics)
             # 阶段3: 训练分布参数
             for epoch in range(config.federated.local_epochs):
                 dist_metrics = clients[k].train_distribution_only(
                     num_iterations=100,
                     num_samples_per_class=16
                 )
-            print('Prob', dist_metrics)
+            # print('Prob', dist_metrics)
             # 合并metrics
             metrics = {
                 'loss': (router_metrics.get('loss', 0) + expert_metrics.get('loss', 0) + dist_metrics.get('loss', 0)) / 3,
@@ -317,6 +339,14 @@ def train_task(
             client_sample_counts=client_sample_counts,
             client_class_counts=client_class_counts
         )
+        
+        # 调试：打印当前全局分布覆盖情况（只在前几轮）
+        if round_idx < 3:
+            dist_classes = server.global_distribution_pool.class_list
+            dist_counts = {c: server.global_distribution_pool.get_distribution(c).sample_count.item() 
+                          for c in dist_classes}
+            print(f"   📦 Global distributions after round {round_idx+1}: "
+                  f"classes={sorted(dist_classes)}, counts={dist_counts}")
         
         # 4.4 分发更新后的全局模型
         for k in active_clients:
@@ -470,6 +500,15 @@ def main():
     print("for Class-Incremental Learning")
     print("="*60)
     
+    # 打印关键配置
+    print(f"\n📋 Configuration:")
+    print(f"   Clients: {config.federated.num_clients}")
+    print(f"   Participation rate: {config.federated.participation_rate} "
+          f"({int(config.federated.num_clients * config.federated.participation_rate)} clients/round)")
+    print(f"   Dirichlet α: {config.federated.alpha}")
+    print(f"   Local epochs: {config.federated.local_epochs}")
+    print(f"   Rounds per task: {config.training.num_rounds}")
+    
     # 创建联邦数据集
     print("\n[1] Loading CIFAR-10 dataset...")
     fed_data = CIFAR10Federated(
@@ -485,11 +524,21 @@ def main():
         'backbone': config.model.backbone,
         'backbone_pretrained': config.model.backbone_pretrained,
         'feature_dim': config.model.feature_dim,
+        # Router配置
         'router_hidden_dim': config.model.router_hidden_dim,
+        'router_num_layers': config.model.router_num_layers,
+        'router_use_residual': config.model.router_use_residual,
+        'router_dropout': config.model.router_dropout,
+        # 其他配置
         'anchor_dim': config.model.anchor_dim,
         'expert_hidden_dim': config.model.expert_hidden_dim,
         'expert_output_dim': config.model.expert_output_dim,
-        'temperature_route': config.training.temperature_route
+        'temperature_route': config.training.temperature_route,
+        # 分布配置（防止过拟合）
+        'distribution_init_std': config.model.distribution_init_std,
+        'distribution_min_std': config.model.distribution_min_std,
+        'distribution_max_std': config.model.distribution_max_std,
+        'distribution_noise_scale': config.model.distribution_noise_scale,
     }
     
     server = FedAMEServer(

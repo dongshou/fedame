@@ -15,6 +15,11 @@ class ClassDistribution(nn.Module):
     单个类别的概率分布（backbone 空间）
     均值 μ: 用真实 backbone 特征均值初始化
     标准差 σ: 随机初始化
+    
+    改进:
+    1. 增大初始方差 - 让采样更分散
+    2. 方差下界约束 - 防止方差训练得太小
+    3. 加入噪声采样 - 增加伪样本多样性
     """
     
     def __init__(
@@ -22,12 +27,18 @@ class ClassDistribution(nn.Module):
         class_id: int,
         dim: int = 512,
         init_mean: Optional[torch.Tensor] = None,
-        init_std: float = 0.1
+        init_std: float = 0.5,  # 增大初始方差 (原来是 0.1)
+        min_std: float = 0.1,   # 方差下界约束
+        max_std: float = 2.0,   # 方差上界
+        noise_scale: float = 0.1  # 采样时额外噪声比例
     ):
         super().__init__()
         
         self.class_id = class_id
         self.dim = dim
+        self.min_std = min_std
+        self.max_std = max_std
+        self.noise_scale = noise_scale
         
         # 可学习的均值（用真实特征均值初始化）
         if init_mean is not None:
@@ -35,7 +46,7 @@ class ClassDistribution(nn.Module):
         else:
             self.mean = nn.Parameter(torch.zeros(dim))
         
-        # 可学习的对数标准差（随机初始化）
+        # 可学习的对数标准差（用更大的初始值）
         self.log_std = nn.Parameter(torch.randn(dim) * 0.01 + math.log(init_std))
         
         # 样本计数（用于聚合时的加权）
@@ -43,26 +54,52 @@ class ClassDistribution(nn.Module):
     
     @property
     def std(self) -> torch.Tensor:
-        """分布标准差"""
-        return torch.exp(self.log_std).clamp(min=1e-6, max=2.0)
+        """分布标准差（带下界约束）"""
+        return torch.exp(self.log_std).clamp(min=self.min_std, max=self.max_std)
     
     @property
     def variance(self) -> torch.Tensor:
         """分布方差"""
         return self.std ** 2
     
-    def sample(self, num_samples: int = 1) -> torch.Tensor:
+    def sample(self, num_samples: int = 1, add_noise: bool = True) -> torch.Tensor:
         """
-        重参数化采样（梯度可传）
+        重参数化采样（梯度可传）+ 额外噪声
         
         Args:
             num_samples: 采样数量
+            add_noise: 是否添加额外噪声增加多样性
+        
+        Returns:
+            samples: [num_samples, dim]
+        """
+        # 基础采样
+        eps = torch.randn(num_samples, self.dim, device=self.mean.device)
+        samples = self.mean.unsqueeze(0) + eps * self.std.unsqueeze(0)
+        
+        # 添加额外噪声增加多样性
+        if add_noise and self.noise_scale > 0:
+            # 噪声大小与均值的范数成比例
+            mean_norm = self.mean.norm() + 1e-6
+            extra_noise = torch.randn_like(samples) * (self.noise_scale * mean_norm)
+            samples = samples + extra_noise
+        
+        return samples
+    
+    def sample_diverse(self, num_samples: int = 1, temperature: float = 1.5) -> torch.Tensor:
+        """
+        多样性采样（增大方差）
+        
+        Args:
+            num_samples: 采样数量
+            temperature: 温度系数，>1 增加多样性
         
         Returns:
             samples: [num_samples, dim]
         """
         eps = torch.randn(num_samples, self.dim, device=self.mean.device)
-        samples = self.mean.unsqueeze(0) + eps * self.std.unsqueeze(0)
+        # 用 temperature 放大标准差
+        samples = self.mean.unsqueeze(0) + eps * (self.std.unsqueeze(0) * temperature)
         return samples
     
     def update_sample_count(self, count: int):
@@ -93,12 +130,18 @@ class DistributionPool(nn.Module):
     def __init__(
         self,
         dim: int = 512,
-        init_std: float = 0.1
+        init_std: float = 0.5,   # 增大初始方差 (原来是 0.1)
+        min_std: float = 0.1,    # 方差下界约束
+        max_std: float = 2.0,    # 方差上界
+        noise_scale: float = 0.1  # 采样时额外噪声比例
     ):
         super().__init__()
         
         self.dim = dim
         self.init_std = init_std
+        self.min_std = min_std
+        self.max_std = max_std
+        self.noise_scale = noise_scale
         
         # 类别分布字典
         self.distributions = nn.ModuleDict()
@@ -122,7 +165,10 @@ class DistributionPool(nn.Module):
             class_id=class_id,
             dim=self.dim,
             init_mean=init_mean,
-            init_std=self.init_std
+            init_std=self.init_std,
+            min_std=self.min_std,
+            max_std=self.max_std,
+            noise_scale=self.noise_scale
         )
         
         # 移动到正确设备

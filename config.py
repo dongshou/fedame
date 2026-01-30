@@ -58,9 +58,11 @@ class ModelConfig:
     backbone_pretrained: bool = True
     feature_dim: int = 512
     
-    # Router
-    router_hidden_dim: int = 256
-    router_output_dim: int = 128
+    # Router (更复杂的网络)
+    router_hidden_dim: int = 512  # 增大隐藏维度
+    router_num_layers: int = 5    # 5层网络
+    router_use_residual: bool = True  # 使用残差连接
+    router_dropout: float = 0.1
     
     # Expert
     expert_hidden_dim: int = 256
@@ -71,9 +73,11 @@ class ModelConfig:
     # Anchor
     anchor_dim: int = 512  # CLIP embedding dimension
     
-    # Distribution Prompt
-    distribution_dim: int = 64
-    max_residual_norm: float = 0.5
+    # Distribution Prompt (改进版，防止过拟合)
+    distribution_init_std: float = 0.5   # 增大初始方差 (原来是 0.1)
+    distribution_min_std: float = 0.1    # 方差下界约束
+    distribution_max_std: float = 2.0    # 方差上界
+    distribution_noise_scale: float = 0.1  # 采样时额外噪声比例
 
 @dataclass
 class FederatedConfig:

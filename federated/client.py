@@ -108,7 +108,7 @@ class FedAMEClient:
     
     def init_distributions_from_data(self, train_loader: DataLoader):
         """
-        用真实 backbone 特征均值初始化分布
+        用真实 backbone 特征均值初始化/更新本地类的分布
         
         Args:
             train_loader: 训练数据加载器
@@ -128,14 +128,22 @@ class FedAMEClient:
                     if cls in class_features:
                         class_features[cls].append(features[i].cpu())
         
-        # 计算均值并初始化分布
+        # 计算均值并初始化/更新分布
         for cls in self.local_classes:
             if len(class_features[cls]) > 0:
                 feats = torch.stack(class_features[cls], dim=0)  # [N, 512]
                 mean = feats.mean(dim=0).to(self.device)  # [512]
                 
-                self.distribution_pool.add_class(cls, init_mean=mean)
-                self.distribution_pool.get_distribution(cls).update_sample_count(len(feats))
+                if self.distribution_pool.has_class(cls):
+                    # 类已存在（从全局分布加载），用本地数据更新
+                    dist = self.distribution_pool.get_distribution(cls)
+                    dist.mean.data = mean
+                    dist.sample_count = torch.tensor(float(len(feats)), device=self.device)
+                else:
+                    # 类不存在，新建
+                    self.distribution_pool.add_class(cls, init_mean=mean)
+                    self.distribution_pool.get_distribution(cls).update_sample_count(len(feats))
+        
         # 重新初始化优化器（包含新的分布参数）
         self._init_optimizer()
     
@@ -178,10 +186,18 @@ class FedAMEClient:
         self,
         train_loader: DataLoader,
         num_pseudo_samples: int = 50,
-        lambda_pseudo: float = 0.2
+        lambda_pseudo: float = 1.0,  # 伪样本与真实数据同等权重
+        use_contrast: bool = False
     ) -> Dict[str, float]:
         """
         阶段1: 只训练路由器（冻结专家）
+        通过伪样本将 NIID 数据补全到 IID 程度
+        
+        Args:
+            train_loader: 训练数据加载器
+            num_pseudo_samples: 每个非本地类每个batch的伪样本数量（用于平衡）
+            lambda_pseudo: 伪样本损失权重（默认1.0，与真实数据同等）
+            use_contrast: 是否使用对比损失
         """
         self.router.train()
         self.expert_pool.eval()
@@ -192,22 +208,86 @@ class FedAMEClient:
         
         loss_components = {'route': 0.0, 'contrast': 0.0, 'pseudo': 0.0}
         
+        # 获取分布池中所有有效的类
+        dist_classes = [c for c in self.distribution_pool.class_list 
+                       if self.distribution_pool.get_distribution(c).sample_count.item() >= 1]
+        
+        # 获取可采样的非本地类（用于补全到 IID）
+        non_local_classes = [c for c in dist_classes if c not in self.local_classes]
+        
+        # 计算每个 batch 中每类应该有多少样本（目标 IID）
+        # 假设总共有 num_classes 个类，每类样本数应该相近
+        num_total_classes = len(self.class_anchors)
+        
+        for param in self.expert_pool.parameters():
+            param.requires_grad = False
+        for param in self.router.parameters():
+            param.requires_grad = True
+        
         for batch_idx, (images, labels) in enumerate(train_loader):
             images = images.to(self.device)
             labels = labels.to(self.device)
+            batch_size = images.size(0)
             
-            for param in self.expert_pool.parameters():
-                param.requires_grad = False
-            for param in self.router.parameters():
-                param.requires_grad = True
-            
+            # 1. 获取真实数据的 backbone 特征
             with torch.no_grad():
                 backbone_features = self.backbone(images)
             
-            expert_ids, routing_probs, projected = self.router(backbone_features)
+            # 2. 统计当前 batch 中每类的样本数
+            batch_class_counts = {}
+            for l in labels.tolist():
+                batch_class_counts[l] = batch_class_counts.get(l, 0) + 1
             
+            # 3. 计算目标：每类应该有多少样本（取当前 batch 平均值）
+            avg_samples_per_class = max(batch_class_counts.values())
+            
+            # 4. 为非本地类采样伪样本，补全到 IID
+            pseudo_features_list = []
+            pseudo_labels_list = []
+            
+            if len(non_local_classes) > 0:
+                for cls in non_local_classes:
+                    try:
+                        dist = self.distribution_pool.get_distribution(cls)
+                        
+                        # 每个非本地类采样 avg_samples_per_class 个样本
+                        n_samples = avg_samples_per_class
+                        z_pseudo = dist.sample(n_samples)
+                        
+                        if torch.isnan(z_pseudo).any() or torch.isinf(z_pseudo).any():
+                            continue
+                        
+                        pseudo_features_list.append(z_pseudo)
+                        pseudo_labels_list.append(
+                            torch.full((n_samples,), cls, dtype=torch.long, device=self.device)
+                        )
+                    except Exception:
+                        continue
+            
+            # 5. 合并真实数据和伪样本
+            if len(pseudo_features_list) > 0:
+                pseudo_features = torch.cat(pseudo_features_list, dim=0)
+                pseudo_labels = torch.cat(pseudo_labels_list, dim=0)
+                
+                all_features = torch.cat([backbone_features, pseudo_features], dim=0)
+                all_labels = torch.cat([labels, pseudo_labels], dim=0)
+                
+                # 标记真实/伪样本
+                is_real = torch.cat([
+                    torch.ones(batch_size, device=self.device),
+                    torch.zeros(len(pseudo_labels), device=self.device)
+                ])
+            else:
+                all_features = backbone_features
+                all_labels = labels
+                is_real = torch.ones(batch_size, device=self.device)
+            
+            # 6. Router 前向传播
+            expert_ids, routing_probs, projected = self.router(all_features)
+            
+            # 7. 计算目标簇
             target_experts = torch.tensor(
-                [self.expert_pool.get_expert_for_class(l.item()) for l in labels],
+                [self.expert_pool.get_expert_for_class(l.item()) for l in all_labels],
                 device=self.device
             )
             target_clusters = torch.tensor(
@@ -215,89 +295,59 @@ class FedAMEClient:
                 device=self.device
             )
             
-            # 路由损失
+            # 8. 计算路由损失（真实数据和伪样本同等对待，实现 IID 训练）
             log_probs = torch.log(routing_probs + 1e-10)
+            
+            # 统一计算损失（不区分真实/伪样本，因为目标是 IID）
             L_route = F.nll_loss(log_probs, target_clusters)
             
-            # 对比损失
-            L_contrast = self.criterion.contrast_loss(
-                projected, labels, self.class_anchors
-            )
+            # 分开统计用于日志
+            real_mask = is_real.bool()
+            pseudo_mask = ~real_mask
             
+            if real_mask.any():
+                L_route_real = F.nll_loss(log_probs[real_mask], target_clusters[real_mask])
+            else:
+                L_route_real = torch.tensor(0.0, device=self.device)
+            
+            if pseudo_mask.any():
+                L_route_pseudo = F.nll_loss(log_probs[pseudo_mask], target_clusters[pseudo_mask])
+            else:
+                L_route_pseudo = torch.tensor(0.0, device=self.device)
+            
+            # 9. 可选：对比损失
+            L_contrast = torch.tensor(0.0, device=self.device)
+            if use_contrast:
+                L_contrast = self.criterion.contrast_loss(projected, all_labels, self.class_anchors)
+                L_route = L_route + 0.1 * L_contrast
+            
+            # 10. 反向传播
             self.optimizer.zero_grad()
-            router_loss = L_route + 0.3 * L_contrast
-            router_loss.backward()
+            L_route.backward()
             torch.nn.utils.clip_grad_norm_(self.router.parameters(), max_norm=1.0)
             self.optimizer.step()
             
-            total_loss += router_loss.item()
-            loss_components['route'] += L_route.item()
+            # 11. 记录指标
+            total_loss += L_route.item()
+            loss_components['route'] += L_route_real.item()
+            loss_components['pseudo'] += L_route_pseudo.item() if pseudo_mask.any() else 0.0
             loss_components['contrast'] += L_contrast.item()
             
+            # 路由准确率（统计所有样本，包括伪样本）
             routed_clusters = torch.argmax(routing_probs, dim=-1)
             routing_correct = (routed_clusters == target_clusters).sum().item()
             total_routing_correct += routing_correct
-            total_routing_samples += len(labels)
-        
-        # 伪样本训练路由器
-        non_local_classes = [
-            c for c in range(len(self.class_anchors))
-            if c not in self.local_classes and self.distribution_pool.has_class(c)
-        ]
-        
-        if len(non_local_classes) > 0 and num_pseudo_samples > 0:
-            for cls in non_local_classes:
-                try:
-                    dist = self.distribution_pool.get_distribution(cls)
-                    if dist.sample_count < 10:
-                        continue
-                    
-                    # 采样（backbone 空间）
-                    z_pseudo = dist.sample(num_pseudo_samples)
-                    
-                    if torch.isnan(z_pseudo).any() or torch.isinf(z_pseudo).any():
-                        continue
-                    
-                    # 通过 Router 前向传播
-                    _, routing_probs, _ = self.router(z_pseudo)
-                    
-                    target_expert = self.expert_pool.get_expert_for_class(cls)
-                    if target_expert not in self.expert_to_cluster:
-                        continue
-                    target_cluster = self.expert_to_cluster[target_expert]
-                    target_clusters = torch.full(
-                        (num_pseudo_samples,), target_cluster,
-                        dtype=torch.long, device=self.device
-                    )
-                    
-                    log_probs = torch.log(routing_probs + 1e-10)
-                    L_pseudo_route = F.nll_loss(log_probs, target_clusters)
-                    
-                    if torch.isnan(L_pseudo_route) or torch.isinf(L_pseudo_route):
-                        continue
-                    
-                    self.optimizer.zero_grad()
-                    (lambda_pseudo * L_pseudo_route).backward()
-                    torch.nn.utils.clip_grad_norm_(self.router.parameters(), max_norm=1.0)
-                    self.optimizer.step()
-                    
-                    loss_components['pseudo'] += L_pseudo_route.item()
-                    
-                except Exception as e:
-                    continue
+            total_routing_samples += len(all_labels)
         
         num_batches = len(train_loader)
-        pseudo_batches = len(non_local_classes) if len(non_local_classes) > 0 else 1
         
         metrics = {
             'loss': total_loss / num_batches,
             'routing_accuracy': total_routing_correct / max(total_routing_samples, 1) * 100,
+            'loss_route': loss_components['route'] / num_batches,
+            'loss_contrast': loss_components['contrast'] / num_batches,
+            'loss_pseudo': loss_components['pseudo'] / num_batches,
         }
-        for key in loss_components:
-            if key == 'pseudo':
-                metrics[f'loss_{key}'] = loss_components[key] / pseudo_batches
-            else:
-                metrics[f'loss_{key}'] = loss_components[key] / num_batches
         
         return metrics
     
@@ -506,8 +556,15 @@ class FedAMEClient:
         return updates
     
     def get_distribution_params(self) -> Dict[int, Dict]:
-        """获取分布参数"""
-        return self.distribution_pool.get_all_params()
+        """
+        获取分布参数（只返回本地类的分布）
+        避免重复上传从全局加载的非本地类分布
+        """
+        params = {}
+        for cls in self.local_classes:
+            if self.distribution_pool.has_class(cls):
+                params[cls] = self.distribution_pool.get_distribution(cls).get_params()
+        return params
     
     def load_global_model(
         self,
