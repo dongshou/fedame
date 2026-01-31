@@ -78,6 +78,11 @@ class ModelConfig:
     distribution_min_std: float = 0.1    # 方差下界约束
     distribution_max_std: float = 2.0    # 方差上界
     distribution_noise_scale: float = 0.1  # 采样时额外噪声比例
+    
+    # FedPCI 双分支架构配置
+    fedpci_hidden_dim: int = 256   # 分支隐藏维度
+    fedpci_output_dim: int = 128   # 分支输出维度（原型维度）
+    fedpci_num_layers: int = 3     # 分支网络层数
 
 @dataclass
 class FederatedConfig:
@@ -123,6 +128,16 @@ class TrainingConfig:
     lambda_contrast: float = 0.3
     lambda_forget: float = 0.5
     lambda_dist: float = 0.1
+    
+    # FedPCI 损失权重
+    lambda_cls_full: float = 1.0      # 完整分类损失权重
+    lambda_common: float = 0.3         # 共性紧凑损失权重
+    lambda_sigma: float = 0.01         # σ正则化损失权重
+    lambda_ind: float = 0.5            # 个性化距离权重
+    lambda_proto_align: float = 0.3    # 原型对齐损失权重（新增）
+    
+    # 原型聚合
+    prototype_momentum: float = 0.7    # 原型动量系数（新增）
     
     # 温度系数
     temperature_route: float = 0.1

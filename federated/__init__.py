@@ -2,3 +2,5 @@ from federated.client import FedAMEClient
 from federated.server import FedAMEServer
 from federated.decoupled_client import DecoupledClient
 from federated.decoupled_server import DecoupledServer
+from federated.fedpci_client import FedPCIClient
+from federated.fedpci_server import FedPCIServer
