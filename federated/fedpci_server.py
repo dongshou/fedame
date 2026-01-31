@@ -453,11 +453,11 @@ class FedPCIServer:
                 features = self.backbone(images)
                 
                 # 计算距离
-                d_total, d_common, d_ind = self.global_model(features)
+                d_total, d_common, d_ind,comm_logit, ind_logit = self.global_model(features)
                 
                 # 预测
-                pred_common = torch.argmin(d_common, dim=-1)
-                pred_full = torch.argmin(d_total, dim=-1)
+                pred_common = torch.argmin(comm_logit, dim=-1)
+                pred_full = torch.argmin(ind_logit, dim=-1)
                 
                 # 统计
                 for i in range(len(labels)):

@@ -128,7 +128,7 @@ class FedPCIClient:
                     if cls in class_features:
                         # 提取该类的共性特征
                         network = self.model.get_class_network(cls)
-                        z_common = network.g_common(features[i:i+1])
+                        z_common,_ = network.g_common(features[i:i+1])
                         class_features[cls].append(z_common.squeeze(0).cpu())
                         class_counts[cls] += 1
         
@@ -181,7 +181,7 @@ class FedPCIClient:
                     features = self.backbone(images)
                 
                 # 2. 前向传播：计算所有类的距离
-                d_total, d_common, d_ind = self.model(features)
+                d_total, d_common, d_ind,comm_logit, ind_logit = self.model(features)
                 
                 # 3. 获取目标类的共性特征（用于紧凑损失）
                 batch_size = features.size(0)
@@ -189,7 +189,7 @@ class FedPCIClient:
                 for i in range(batch_size):
                     cls = labels[i].item()
                     network = self.model.get_class_network(cls)
-                    z_common, _ = network(features[i:i+1])
+                    z_common, _, _, _ = network(features[i:i+1])
                     z_common_target_list.append(z_common.squeeze(0))
                 z_common_target = torch.stack(z_common_target_list, dim=0)
                 
@@ -225,7 +225,9 @@ class FedPCIClient:
                     local_classes=self.local_classes,
                     use_global_loss=use_global_loss,
                     local_prototypes=local_prototypes,
-                    global_prototypes=global_prototypes
+                    global_prototypes=global_prototypes,
+                    comm_logits=comm_logit,
+                    ind_logits=ind_logit
                 )
                 
                 # 7. 反向传播
@@ -361,13 +363,13 @@ class FedPCIClient:
                 features = self.backbone(images)
                 
                 # 计算距离
-                d_total, d_common, d_ind = self.model(features)
+                d_total, d_common, d_ind, com_logit, ind_logit = self.model(features)
                 
                 # 预测（仅用共性）
-                pred_common = torch.argmin(d_common, dim=-1)
+                pred_common = torch.argmin(com_logit, dim=-1)
                 
                 # 预测（完整）
-                pred_full = torch.argmin(d_total, dim=-1)
+                pred_full = torch.argmin(ind_logit, dim=-1)
                 
                 # 统计
                 for i in range(len(labels)):

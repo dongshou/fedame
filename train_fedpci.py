@@ -268,7 +268,8 @@ def train_task(
             print(f"         📊 Client Training Losses (avg across {len(active_clients)} clients):")
             avg_losses = {
                 'cls_common': 0, 'cls_full': 0, 'global': 0,
-                'common_compact': 0, 'sigma_reg': 0, 'proto_align': 0, 'orth':0
+                'common_compact': 0, 'sigma_reg': 0, 'proto_align': 0, 'orth':0,
+                'cla_common': 0, 'cla_ind': 0
             }
             for cm in client_detailed_metrics:
                 m = cm['metrics']
@@ -279,6 +280,8 @@ def train_task(
                 avg_losses['sigma_reg'] += m.get('sigma_reg_loss', 0)
                 avg_losses['proto_align'] += m.get('proto_align_loss', 0)
                 avg_losses['orth'] += m.get('orth_loss', 0)
+                avg_losses['common_cla'] = m.get('cls_ind_cla', 0)
+                avg_losses['ind_cla'] = m.get('cls_ind_cla', 0)
             
             n = len(client_detailed_metrics)
             print(f"            L_cls_common:    {avg_losses['cls_common']/n:.4f}")
@@ -288,6 +291,8 @@ def train_task(
             print(f"            L_sigma_reg:     {avg_losses['sigma_reg']/n:.4f}")
             print(f"            L_proto_align:   {avg_losses['proto_align']/n:.4f}")
             print(f"            L_orth:          {avg_losses['orth']/n:.4f}")
+            print(f"            L_cla_common:    {avg_losses['common_cla']/n:.4f}")
+            print(f"            L_cla_ind:       {avg_losses['ind_cla']/n:.4f}")
             
             # 2. 客户端原型距离
             print(f"         📊 Client Prototype Distances (after training):")

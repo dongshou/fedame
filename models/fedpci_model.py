@@ -59,7 +59,7 @@ class FeatureBranch(nn.Module):
         
         self.network = nn.Sequential(*layers)
         
-        self.classifer = nn.sequence(
+        self.classifer = nn.Sequential(
             nn.Linear(output_dim, num_classes),
             nn.Softmax(dim=-1)
         )
@@ -87,7 +87,7 @@ class FeatureBranch(nn.Module):
             transformed: 变换后的特征 [B, output_dim]
         """
         transformed = self.network(x)
-        if commond:
+        if commond!= None:
             transformed = transformed + commond
         if normalize:
             transformed = F.normalize(transformed, p=2, dim=-1)
@@ -383,7 +383,7 @@ class FedPCIModel(nn.Module):
         
         for c in range(self.num_classes):
             network = self.get_class_network(c)
-            d_total, d_common, d_ind,commond_result, ind_result = network.compute_distance(x, self.lambda_ind)
+            d_total, d_common, d_ind, commond_result, ind_result = network.compute_distance(x, self.lambda_ind)
             d_total_list.append(d_total)
             d_common_list.append(d_common)
             d_ind_list.append(d_ind)
@@ -393,8 +393,10 @@ class FedPCIModel(nn.Module):
         d_total = torch.stack(d_total_list, dim=-1)  # [B, num_classes]
         d_common = torch.stack(d_common_list, dim=-1)
         d_ind = torch.stack(d_ind_list, dim=-1)
+        commond_logits = torch.stack(commond_result_list, dim=-1)
+        ind_logits = torch.stack(ind_result_list, dim=-1)
         
-        return d_total, d_common, d_ind, commond_result_list, ind_result_list
+        return d_total, d_common, d_ind, commond_logits, ind_logits
     
     def predict(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """

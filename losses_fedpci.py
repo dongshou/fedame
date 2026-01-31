@@ -346,6 +346,7 @@ class FedPCILoss(nn.Module):
         self.sigma_reg_loss = SigmaRegularizationLoss()
         self.proto_align_loss = PrototypeAlignmentLoss()
         self.orth_loss = CovarianceOrthogonalLoss()
+        self.ces_loss = torch.nn.CrossEntropyLoss
     
     def forward(
         self,
@@ -360,7 +361,9 @@ class FedPCILoss(nn.Module):
         local_prototypes: Optional[List[torch.Tensor]] = None,
         global_prototypes: Optional[List[torch.Tensor]] = None,
         z_common: Optional[torch.Tensor] = None,
-        z_individual: Optional[torch.Tensor] = None
+        z_individual: Optional[torch.Tensor] = None,
+        comm_logits: Optional[torch.Tensor] = None,
+        ind_logits: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         计算总损失
@@ -392,6 +395,14 @@ class FedPCILoss(nn.Module):
         """
         losses = {}
         device = d_total.device
+        
+        if comm_logits is not None:
+            print(f"comm_logits: {comm_logits.shape}")
+            print(targets.shape)
+            losses['cls_common_cla'] = self.ces_loss(comm_logits, targets)
+            
+        if ind_logits is not None:
+            losses['cls_ind_cla'] = self.ces_loss(ind_logits, targets)
         
         # 1. 共性分类损失（局部）
         losses['cls_common'] = self.cls_common_loss(d_common, targets, local_classes)
@@ -433,7 +444,9 @@ class FedPCILoss(nn.Module):
             self.lambda_common * losses['common_compact'] +
             self.lambda_sigma * losses['sigma_reg'] +
             self.lambda_proto_align * losses['proto_align'] +
-            self.lambda_orth * losses['orth']
+            self.lambda_orth * losses['orth'] +
+            losses['cls_common_cla'] +
+            losses['cls_ind_cla']
         )
         
         return losses
