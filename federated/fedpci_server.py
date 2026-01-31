@@ -1,12 +1,14 @@
 """
-FedPCI 联邦学习服务端
+FedPCI 联邦学习服务端 (重构版)
 
 核心特点：
 - 管理全局模型
 - 聚合规则：
-  - g_common[c]: 选择性聚合（仅拥有类c的客户端参与）
-  - g_ind[c]: 不聚合（完全本地）
-  - 原型 (μ, σ): 选择性聚合
+  - g_common: 聚合
+  - g_ind: 不聚合（客户端本地保留）
+  - classifier_common: 聚合
+  - classifier_full: 不聚合
+  - prototypes: 选择性聚合（仅拥有该类的客户端参与）
 """
 
 import torch
@@ -22,7 +24,7 @@ from models.backbone import create_backbone
 
 class FedPCIServer:
     """
-    FedPCI 联邦服务端
+    FedPCI 联邦服务端 (重构版)
     """
     
     def __init__(
@@ -31,12 +33,12 @@ class FedPCIServer:
         class_names: List[str],
         model_config: Dict,
         device: str = "cuda",
-        prototype_momentum: float = 0.9
+        momentum: float = 0.5
     ):
         self.num_classes = num_classes
         self.class_names = class_names
         self.device = device
-        self.prototype_momentum = prototype_momentum  # 原型动量系数
+        self.momentum = momentum  # 动量系数
         
         # 初始化全局模型
         self._init_global_model(model_config)
@@ -44,8 +46,8 @@ class FedPCIServer:
         # 已学习的类别
         self.learned_classes: List[int] = []
         
-        # 客户端信息
-        self.client_info: Dict[int, Dict] = {}
+        # 记录每个类有多少客户端拥有
+        self.class_client_count: Dict[int, int] = {c: 0 for c in range(num_classes)}
     
     def _init_global_model(self, config: Dict):
         """初始化全局模型"""
@@ -63,12 +65,20 @@ class FedPCIServer:
             hidden_dim=config.get('hidden_dim', 256),
             output_dim=config.get('output_dim', 128),
             num_layers=config.get('num_layers', 3),
-            dropout=config.get('dropout', 0.1),
-            sigma_min=config.get('sigma_min', 0.1),
-            sigma_max=config.get('sigma_max', 2.0),
-            lambda_ind=config.get('lambda_ind', 0.5),
-            temperature=config.get('temperature', 0.1)
+            dropout=config.get('dropout', 0.1)
         ).to(self.device)
+    
+    def get_global_params(self) -> Dict[str, any]:
+        """
+        获取全局参数（发送给客户端）
+        
+        Returns:
+            dict containing:
+                - g_common: 共性分支参数
+                - classifier_common: 共性分类头参数
+                - prototypes: 原型参数
+        """
+        return self.global_model.get_aggregatable_params()
     
     def prepare_task(self, task_classes: List[int]) -> Dict:
         """
@@ -88,329 +98,122 @@ class FedPCIServer:
             'old_classes': self.learned_classes.copy()
         }
     
-    def get_client_config(
-        self,
-        client_id: int,
-        client_classes: List[int]
-    ) -> Dict:
-        """
-        获取客户端配置
-        
-        Args:
-            client_id: 客户端ID
-            client_classes: 客户端拥有的类别
-        
-        Returns:
-            config: 客户端配置
-        """
-        # 保存客户端信息
-        self.client_info[client_id] = {
-            'classes': client_classes
-        }
-        
-        # 获取所有类的共性分支参数
-        global_common_params = self.global_model.get_all_common_params()
-        
-        # 获取所有类的原型参数
-        global_prototype_params = self.global_model.get_all_prototype_params()
-        
-        return {
-            'client_id': client_id,
-            'local_classes': client_classes,
-            'common_params': global_common_params,
-            'prototype_params': global_prototype_params
-        }
-    
     def aggregate(
         self,
-        client_common_updates: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
-        client_prototype_updates: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
+        client_updates: List[Dict[str, any]],
         verbose: bool = False
     ):
         """
         聚合客户端更新
         
         聚合规则：
-        - g_common[c]: 选择性聚合，用原型距离加权 + 动量
-        - g_ind[c]: 不聚合（客户端本地保留）
-        - prototype[c]: 选择性聚合，样本数加权 + 动量
+        - g_common: FedAvg + 动量
+        - classifier_common: FedAvg + 动量
+        - prototypes: 选择性聚合（仅拥有该类的客户端参与）+ 动量
         
         Args:
-            client_common_updates: {client_id: {class_id: {param_name: param_value}}}
-            client_prototype_updates: {client_id: {class_id: {param_name: param_value}}}
+            client_updates: 客户端更新列表，每个元素包含:
+                - g_common: 共性分支参数
+                - classifier_common: 共性分类头参数
+                - prototypes: 原型参数
+                - local_classes: 本地拥有的类别
             verbose: 是否打印详细日志
         """
-        # 记录聚合前的状态
-        if verbose:
-            pre_state = self._get_model_state_summary()
+        if len(client_updates) == 0:
+            return
         
-        # 1. 聚合共性分支参数（使用原型距离加权 + 动量）
-        proto_info = self._aggregate_prototype_params(client_prototype_updates, verbose)
-
-        new_global_prototypes = {}
-        for class_id in range(self.num_classes):
-            proto_params = self.global_model.get_prototype_params(class_id)
-            new_global_prototypes[class_id] = proto_params['mean'].cpu().float()
-        # 2. 聚合原型参数（样本数加权 + 动量）
-        agg_info = self._aggregate_common_params(
-            client_common_updates,
-            client_prototype_updates,
-            new_global_prototypes,  # 传入新的全局原型
-            verbose=verbose
+        num_clients = len(client_updates)
+        
+        # ============ 1. 聚合 g_common ============
+        old_g_common = self.global_model.get_common_branch_params()
+        new_g_common = self._aggregate_params(
+            [u['g_common'] for u in client_updates],
+            old_g_common
         )
+        self.global_model.set_common_branch_params(new_g_common)
         
-        # 记录聚合后的状态
-        if verbose:
-            post_state = self._get_model_state_summary()
-            self._print_aggregation_summary(pre_state, post_state, agg_info, proto_info)
-    
-    def _get_model_state_summary(self) -> Dict:
-        """获取模型状态摘要"""
-        state = {
-            'prototypes': {},
-            'g_common_norms': {}
-        }
+        # ============ 2. 聚合 classifier_common ============
+        old_classifier = self.global_model.get_classifier_common_params()
+        new_classifier = self._aggregate_params(
+            [u['classifier_common'] for u in client_updates],
+            old_classifier
+        )
+        self.global_model.set_classifier_common_params(new_classifier)
+        
+        # ============ 3. 选择性聚合 prototypes ============
+        old_prototypes = self.global_model.get_prototype_params()  # [num_classes, d]
+        new_prototypes = old_prototypes.clone()
+        
+        # 统计每个类有哪些客户端
+        class_updates: Dict[int, List[torch.Tensor]] = {c: [] for c in range(self.num_classes)}
+        
+        for update in client_updates:
+            local_classes = update['local_classes']
+            client_protos = update['prototypes']  # [num_classes, d]
+            
+            for c in local_classes:
+                class_updates[c].append(client_protos[c])
+        
+        # 对每个类聚合原型
+        aggregation_info = {}
         for c in range(self.num_classes):
-            # 原型
-            mu = self.global_model.get_prototype_mean(c)
-            sigma = self.global_model.get_class_network(c).prototype.sigma
-            state['prototypes'][c] = {
-                'mu_norm': torch.norm(mu).item(),
-                'mu_mean': mu.mean().item(),
-                'sigma_mean': sigma.mean().item()
-            }
-            # g_common 参数范数
-            params = self.global_model.get_common_params(c)
-            total_norm = sum(torch.norm(p).item() for p in params.values())
-            state['g_common_norms'][c] = total_norm
-        return state
-    
-    def _print_aggregation_summary(self, pre_state, post_state, agg_info, proto_info):
-        """打印聚合摘要"""
-        print("\n         📊 Aggregation Summary:")
-        print("         ┌─────────────────────────────────────────────────────────┐")
-        
-        # g_common 聚合信息
-        if agg_info:
-            print("         │ g_common aggregation (distance-weighted + momentum):   │")
-            for c, info in sorted(agg_info.items()):
-                if info['num_clients'] > 0:
-                    weights_str = ", ".join([f"{w:.2f}" for w in info['weights'][:3]])
-                    if len(info['weights']) > 3:
-                        weights_str += "..."
-                    print(f"         │   Class {c}: {info['num_clients']} clients, "
-                          f"dists=[{', '.join([f'{d:.2f}' for d in info['distances'][:3]])}], "
-                          f"weights=[{weights_str}]")
-        
-        # 原型聚合信息
-        if proto_info:
-            print("         │ Prototype aggregation (sample-weighted + momentum):    │")
-            for c, info in sorted(proto_info.items()):
-                if info['num_clients'] > 0:
-                    print(f"         │   Class {c}: {info['num_clients']} clients, "
-                          f"μ_change={info['mu_change']:.4f}, "
-                          f"σ_change={info['sigma_change']:.4f}")
-        
-        # 状态变化
-        print("         │ State changes:                                          │")
-        for c in range(min(5, self.num_classes)):  # 只打印前5个类
-            pre_mu = pre_state['prototypes'][c]['mu_norm']
-            post_mu = post_state['prototypes'][c]['mu_norm']
-            pre_g = pre_state['g_common_norms'][c]
-            post_g = post_state['g_common_norms'][c]
-            print(f"         │   Class {c}: μ_norm {pre_mu:.2f}→{post_mu:.2f}, "
-                  f"g_norm {pre_g:.1f}→{post_g:.1f}")
-        
-        print("         └─────────────────────────────────────────────────────────┘")
-    
-    def _aggregate_common_params(
-        self,
-        client_updates: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
-        client_prototype_updates: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
-        new_global_prototypes: Dict[int, torch.Tensor],  # ← 新增参数
-        verbose: bool = False
-    ) -> Dict[int, Dict]:
-        """
-        聚合共性分支参数
-        
-        使用新聚合的全局原型计算距离权重
-        
-        Args:
-            client_updates: 客户端共性参数更新
-            client_prototype_updates: 客户端原型更新（用于获取本地原型）
-            new_global_prototypes: 新聚合的全局原型 {class_id: mean_tensor}
-        """
-        agg_info = {}
-        
-        # 收集每个类的更新
-        class_updates: Dict[int, List[Tuple[int, Dict[str, torch.Tensor]]]] = {
-            c: [] for c in range(self.num_classes)
-        }
-        
-        for client_id, updates in client_updates.items():
-            for class_id, params in updates.items():
-                class_updates[class_id].append((client_id, params))
-        
-        # 对每个类进行聚合
-        for class_id in range(self.num_classes):
-            updates = class_updates[class_id]
-            
-            agg_info[class_id] = {
-                'num_clients': len(updates),
-                'distances': [],
-                'weights': [],
-                'client_ids': []
-            }
-            
-            if len(updates) == 0:
+            if len(class_updates[c]) == 0:
                 continue
             
-            # ========== 关键修改：使用新的全局原型 ==========
-            global_proto = new_global_prototypes[class_id]
-            # ================================================
-            
-            # 计算每个客户端的距离和权重
-            distances = []
-            client_ids = []
-            for client_id, params in updates:
-                client_ids.append(client_id)
-                if client_id in client_prototype_updates and class_id in client_prototype_updates[client_id]:
-                    local_proto = client_prototype_updates[client_id][class_id]['mean'].cpu().float()
-                else:
-                    local_proto = global_proto.clone()
-                
-                distance = torch.norm(local_proto - global_proto).item()
-                distances.append(distance)
-            
-            # 计算 softmax 权重
-            distances_tensor = torch.tensor(distances)
-            
-            if distances_tensor.max() < 1e-8:
-                weights = torch.ones(len(distances)) / len(distances)
-            else:
-                weights = torch.softmax(-distances_tensor, dim=0)
-            
-            agg_info[class_id]['distances'] = distances
-            agg_info[class_id]['weights'] = weights.tolist()
-            agg_info[class_id]['client_ids'] = client_ids
-            
-            # 加权聚合参数
-            aggregated_params = {}
-            first_params = updates[0][1]
-            
-            for param_name in first_params.keys():
-                param_sum = torch.zeros_like(first_params[param_name].cpu().float())
-                for i, (client_id, params) in enumerate(updates):
-                    param_sum += params[param_name].cpu().float() * weights[i].item()
-                aggregated_params[param_name] = param_sum
+            # 简单平均
+            stacked = torch.stack(class_updates[c], dim=0)  # [n, d]
+            avg_proto = stacked.mean(dim=0)  # [d]
             
             # 动量更新
-            old_params = self.global_model.get_common_params(class_id)
-            momentum = self.prototype_momentum
-            for param_name in aggregated_params.keys():
-                if param_name in old_params:
-                    old_param = old_params[param_name].cpu().float()
-                    aggregated_params[param_name] = (
-                        momentum * old_param + (1 - momentum) * aggregated_params[param_name]
-                    )
+            new_prototypes[c] = self.momentum * old_prototypes[c] + (1 - self.momentum) * avg_proto
             
-            self.global_model.set_common_params(class_id, aggregated_params)
-    
-        return agg_info
-    def _aggregate_prototype_params(
-        self,
-        client_updates: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
-        verbose: bool = False
-    ) -> Dict[int, Dict]:
-        """
-        聚合原型参数（使用动量更新）
+            self.class_client_count[c] = len(class_updates[c])
+            aggregation_info[c] = len(class_updates[c])
         
-        对于每个类 c，只有拥有类 c 的客户端参与聚合
-        使用动量聚合：μ_new = momentum * μ_old + (1 - momentum) * avg(μ_clients)
+        self.global_model.set_prototype_params(new_prototypes)
+        
+        if verbose:
+            self._print_aggregation_info(num_clients, aggregation_info)
+    
+    def _aggregate_params(
+        self,
+        client_params_list: List[Dict[str, torch.Tensor]],
+        old_params: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """
+        聚合参数（FedAvg + 动量）
+        
+        Args:
+            client_params_list: 客户端参数列表
+            old_params: 旧的全局参数
         
         Returns:
-            proto_info: 每个类的原型聚合信息
+            聚合后的参数
         """
-        proto_info = {}
+        num_clients = len(client_params_list)
         
-        # 收集每个类的更新
-        class_updates: Dict[int, List[Dict[str, torch.Tensor]]] = {
-            c: [] for c in range(self.num_classes)
-        }
+        # FedAvg
+        aggregated = {}
+        for key in old_params.keys():
+            stacked = torch.stack([p[key] for p in client_params_list], dim=0)
+            aggregated[key] = stacked.mean(dim=0)
         
-        for client_id, updates in client_updates.items():
-            for class_id, params in updates.items():
-                class_updates[class_id].append(params)
+        # 动量更新
+        new_params = {}
+        for key in old_params.keys():
+            new_params[key] = self.momentum * old_params[key] + (1 - self.momentum) * aggregated[key]
         
-        # 对每个类进行聚合
-        for class_id in range(self.num_classes):
-            updates = class_updates[class_id]
-            
-            proto_info[class_id] = {
-                'num_clients': len(updates),
-                'mu_change': 0.0,
-                'sigma_change': 0.0
-            }
-            
-            if len(updates) == 0:
-                continue
-            
-            # 获取旧的全局原型（用于计算变化）
-            old_params = self.global_model.get_prototype_params(class_id)
-            old_mean = old_params['mean'].cpu().float()
-            old_log_sigma = old_params['log_sigma'].cpu().float()
-            
-            # 计算总样本数（转换为 float 避免溢出）
-            total_count = 0.0
-            for p in updates:
-                if 'sample_count' in p:
-                    cnt = p['sample_count']
-                    if isinstance(cnt, torch.Tensor):
-                        total_count += float(cnt.item())
-                    else:
-                        total_count += float(cnt)
-                else:
-                    total_count += 1.0
-            
-            if total_count == 0:
-                total_count = float(len(updates))  # 均等权重
-            
-            # 聚合 mean 和 log_sigma（客户端平均）
-            dim = updates[0]['mean'].shape[0]
-            aggregated_mean = torch.zeros(dim)
-            aggregated_log_sigma = torch.zeros(dim)
-            
-            for params in updates:
-                if 'sample_count' in params:
-                    cnt = params['sample_count']
-                    if isinstance(cnt, torch.Tensor):
-                        count = float(cnt.item())
-                    else:
-                        count = float(cnt)
-                else:
-                    count = 1.0
-                weight = count / total_count if total_count > 0 else 1.0 / len(updates)
-                
-                aggregated_mean += params['mean'].cpu().float() * weight
-                aggregated_log_sigma += params['log_sigma'].cpu().float() * weight
-            
-            # 动量更新：μ_new = momentum * μ_old + (1 - momentum) * aggregated
-            momentum = self.prototype_momentum
-            new_mean = momentum * old_mean + (1 - momentum) * aggregated_mean
-            new_log_sigma = momentum * old_log_sigma + (1 - momentum) * aggregated_log_sigma
-            
-            # 记录变化量
-            proto_info[class_id]['mu_change'] = torch.norm(new_mean - old_mean).item()
-            proto_info[class_id]['sigma_change'] = torch.norm(new_log_sigma - old_log_sigma).item()
-            
-            # 设置聚合后的参数
-            self.global_model.set_prototype_params(class_id, {
-                'mean': new_mean,
-                'log_sigma': new_log_sigma,
-                'sample_count': torch.tensor(min(total_count, 1e6))
-            })
-        
-        return proto_info
+        return new_params
+    
+    def _print_aggregation_info(self, num_clients: int, aggregation_info: Dict[int, int]):
+        """打印聚合信息"""
+        print(f"\n         📊 Aggregation Summary:")
+        print(f"         ├─ Total clients: {num_clients}")
+        print(f"         ├─ Prototype aggregation (selective):")
+        for c, count in sorted(aggregation_info.items()):
+            if count > 0:
+                print(f"         │  Class {c} ({self.class_names[c]:10s}): {count} clients")
+        print(f"         └─ Momentum: {self.momentum}")
     
     def finish_task(self, task_classes: List[int]):
         """完成任务，更新已学习类别"""
@@ -452,12 +255,12 @@ class FedPCIServer:
                 # 提取特征
                 features = self.backbone(images)
                 
-                # 计算距离
-                d_total, d_common, d_ind,comm_logit, ind_logit = self.global_model(features)
+                # 前向传播
+                output = self.global_model(features)
                 
                 # 预测
-                pred_common = torch.argmin(comm_logit, dim=-1)
-                pred_full = torch.argmin(ind_logit, dim=-1)
+                pred_common = torch.argmax(output['logits_common'], dim=-1)
+                pred_full = torch.argmax(output['logits_full'], dim=-1)
                 
                 # 统计
                 for i in range(len(labels)):
@@ -488,6 +291,7 @@ class FedPCIServer:
             'total_samples': total_samples
         }
         
+        # 每类准确率
         for cls in class_total:
             metrics[f'class_{cls}_acc_common'] = (
                 class_correct_common[cls] / class_total[cls] * 100
@@ -498,19 +302,11 @@ class FedPCIServer:
                 if class_total[cls] > 0 else 0
             )
         
-        # GRPO Gain
-        metrics['grpo_gain'] = metrics['accuracy_full'] - metrics['accuracy_common']
-        
         return metrics
     
-    def diagnose(
-        self,
-        test_loader: DataLoader
-    ) -> Dict:
+    def diagnose(self, test_loader: DataLoader) -> Dict:
         """
         诊断模型性能
-        
-        分析每个类的预测情况
         """
         self.backbone.eval()
         self.global_model.eval()
@@ -525,34 +321,19 @@ class FedPCIServer:
                 labels = labels.to(self.device)
                 
                 features = self.backbone(images)
-                d_total, d_common, _ = self.global_model(features)
+                output = self.global_model(features)
                 
-                pred_common = torch.argmin(d_common, dim=-1)
-                pred_full = torch.argmin(d_total, dim=-1)
+                pred_common = torch.argmax(output['logits_common'], dim=-1)
+                pred_full = torch.argmax(output['logits_full'], dim=-1)
                 
                 for i in range(len(labels)):
                     true_cls = labels[i].item()
                     confusion_common[true_cls, pred_common[i].item()] += 1
                     confusion_full[true_cls, pred_full[i].item()] += 1
         
-        # 计算每类准确率
-        class_acc_common = {}
-        class_acc_full = {}
-        
-        for cls in range(self.num_classes):
-            total = confusion_common[cls].sum().item()
-            if total > 0:
-                class_acc_common[cls] = confusion_common[cls, cls].item() / total
-                class_acc_full[cls] = confusion_full[cls, cls].item() / total
-            else:
-                class_acc_common[cls] = 0
-                class_acc_full[cls] = 0
-        
         return {
             'confusion_common': confusion_common,
             'confusion_full': confusion_full,
-            'class_acc_common': class_acc_common,
-            'class_acc_full': class_acc_full,
             'class_names': self.class_names
         }
     
@@ -569,7 +350,6 @@ class FedPCIServer:
         self.learned_classes = state['learned_classes']
 
 
-# 测试
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -583,18 +363,15 @@ if __name__ == "__main__":
         'hidden_dim': 256,
         'output_dim': 128,
         'num_layers': 3,
-        'dropout': 0.1,
-        'sigma_min': 0.1,
-        'sigma_max': 2.0,
-        'lambda_ind': 0.5,
-        'temperature': 0.1
+        'dropout': 0.1
     }
     
     server = FedPCIServer(
         num_classes=10,
         class_names=class_names,
         model_config=model_config,
-        device=device
+        device=device,
+        momentum=0.9
     )
     
     print(f"Server created on {device}")
@@ -604,7 +381,27 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in server.global_model.parameters())
     print(f"Total model parameters: {total_params:,}")
     
-    # 测试获取客户端配置
-    config = server.get_client_config(client_id=0, client_classes=[0, 1, 2])
-    print(f"\nClient config keys: {list(config.keys())}")
-    print(f"Common params classes: {list(config['common_params'].keys())}")
+    # 测试获取全局参数
+    global_params = server.get_global_params()
+    print(f"\nGlobal params keys: {list(global_params.keys())}")
+    print(f"g_common: {len(global_params['g_common'])} tensors")
+    print(f"classifier_common: {list(global_params['classifier_common'].keys())}")
+    print(f"prototypes shape: {global_params['prototypes'].shape}")
+    
+    # 模拟聚合
+    print("\n--- 模拟聚合测试 ---")
+    
+    # 模拟3个客户端的更新
+    client_updates = []
+    for i in range(3):
+        local_classes = [i, i+1, i+2]  # 每个客户端3个类
+        update = {
+            'g_common': {k: v + torch.randn_like(v) * 0.1 for k, v in global_params['g_common'].items()},
+            'classifier_common': {k: v + torch.randn_like(v) * 0.1 for k, v in global_params['classifier_common'].items()},
+            'prototypes': global_params['prototypes'] + torch.randn_like(global_params['prototypes']) * 0.1,
+            'local_classes': local_classes
+        }
+        client_updates.append(update)
+    
+    server.aggregate(client_updates, verbose=True)
+    print("\nAggregation completed!")

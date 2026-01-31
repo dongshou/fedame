@@ -1,22 +1,27 @@
 """
-FedPCI 模型模块
-双分支架构：共性分支 g_common + 个性化分支 g_ind
-可学习原型：μ (均值) + σ (维度级标准差)
+FedPCI 模型模块 (重构版)
+
+架构：
+- 单一双分支网络：g_common + g_ind
+- 两个分类头：classifier_common (聚合) + classifier_full (不聚合)
+- 可学习原型：μ_local
+
+特征流：
+- z_common = g_common(f) → classifier_common → logits_common
+- z_full = z_common + z_ind → classifier_full → logits_full
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
-import math
 
 
 class FeatureBranch(nn.Module):
     """
-    特征分支网络（共性分支或个性化分支共用结构）
+    特征分支网络
     
     结构: Linear -> LayerNorm -> GELU -> Dropout -> ... -> Linear
-    输出: L2 归一化的特征向量
     """
     
     def __init__(
@@ -25,8 +30,7 @@ class FeatureBranch(nn.Module):
         hidden_dim: int = 256,
         output_dim: int = 128,
         num_layers: int = 3,
-        dropout: float = 0.1,
-        num_classes=10,
+        dropout: float = 0.1
     ):
         super().__init__()
         
@@ -34,7 +38,6 @@ class FeatureBranch(nn.Module):
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         
-        # 构建MLP网络
         layers = []
         
         # 输入层
@@ -58,138 +61,106 @@ class FeatureBranch(nn.Module):
         layers.append(nn.Linear(hidden_dim, output_dim))
         
         self.network = nn.Sequential(*layers)
-        
-        self.classifer = nn.Sequential(
-            nn.Linear(output_dim, num_classes),
-            nn.Softmax(dim=-1)
-        )
-        
-        # 初始化
         self._init_weights()
     
     def _init_weights(self):
-        """初始化权重"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
     
-    def forward(self, x: torch.Tensor, normalize: bool = True, commond=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, normalize: bool = True) -> torch.Tensor:
         """
-        特征变换
-        
         Args:
-            x: 输入特征 [B, input_dim]
+            x: [B, input_dim]
             normalize: 是否L2归一化
         
         Returns:
-            transformed: 变换后的特征 [B, output_dim]
+            z: [B, output_dim]
         """
-        transformed = self.network(x)
-        if commond!= None:
-            transformed = transformed + commond
+        z = self.network(x)
         if normalize:
-            transformed = F.normalize(transformed, p=2, dim=-1)
-        result = self.classifer(transformed)
-        return transformed, result
+            z = F.normalize(z, p=2, dim=-1)
+        return z
 
 
-class ClassPrototype(nn.Module):
+class LearnablePrototypes(nn.Module):
     """
-    类原型
+    可学习原型
     
-    包含：
-    - μ (mean): 类中心，维度 [d]
-    - log_σ (log_std): 对数标准差，维度 [d]，用于归一化个性化特征
-    
-    σ 的作用：
-    - 维度级别的容忍度
-    - σ[i] 大：该维度变化大，放松约束
-    - σ[i] 小：该维度变化小，严格约束
+    每个类别一个原型向量 μ
     """
     
-    def __init__(
-        self,
-        class_id: int,
-        dim: int = 128,
-        sigma_min: float = 0.1,
-        sigma_max: float = 2.0,
-        init_mean: Optional[torch.Tensor] = None
-    ):
+    def __init__(self, num_classes: int, dim: int):
         super().__init__()
         
-        self.class_id = class_id
+        self.num_classes = num_classes
         self.dim = dim
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
         
-        # 可学习的均值 μ
-        if init_mean is not None:
-            self.mean = nn.Parameter(init_mean.clone())
+        # 可学习原型 [num_classes, dim]
+        self.prototypes = nn.Parameter(torch.zeros(num_classes, dim))
+        nn.init.xavier_uniform_(self.prototypes)
+    
+    def forward(self, class_ids: Optional[List[int]] = None) -> torch.Tensor:
+        """
+        获取原型
+        
+        Args:
+            class_ids: 指定类别，None表示所有类别
+        
+        Returns:
+            prototypes: [len(class_ids), dim] 或 [num_classes, dim]
+        """
+        if class_ids is None:
+            return self.prototypes
         else:
-            self.mean = nn.Parameter(torch.zeros(dim))
-        
-        # 可学习的对数标准差 log_σ（初始化为0，即σ=1）
-        self.log_sigma = nn.Parameter(torch.zeros(dim))
-        
-        # 样本计数（用于聚合时加权）
-        self.register_buffer('sample_count', torch.tensor(0.0))
+            return self.prototypes[class_ids]
     
-    @property
-    def sigma(self) -> torch.Tensor:
-        """获取标准差（带上下界约束）"""
-        return torch.exp(self.log_sigma).clamp(min=self.sigma_min, max=self.sigma_max)
+    def get_prototype(self, class_id: int) -> torch.Tensor:
+        """获取单个类别的原型"""
+        return self.prototypes[class_id]
     
-    def update_mean(self, new_mean: torch.Tensor, count: int = 1):
-        """更新均值（用于从数据中提取）"""
-        self.mean.data = new_mean.to(self.mean.device)
-        # 直接设置 count，而不是累加（每轮重新统计）
-        self.sample_count.fill_(float(count))
+    def set_prototype(self, class_id: int, value: torch.Tensor):
+        """设置单个类别的原型"""
+        self.prototypes.data[class_id] = value.to(self.prototypes.device)
     
-    def get_params(self) -> Dict[str, torch.Tensor]:
-        """获取原型参数（用于联邦聚合）"""
-        return {
-            'mean': self.mean.data.clone().cpu(),
-            'log_sigma': self.log_sigma.data.clone().cpu(),
-            'sample_count': self.sample_count.clone().cpu()
-        }
-    
-    def set_params(self, params: Dict[str, torch.Tensor]):
-        """设置原型参数"""
-        if 'mean' in params:
-            self.mean.data = params['mean'].to(self.mean.device)
-        if 'log_sigma' in params:
-            self.log_sigma.data = params['log_sigma'].to(self.log_sigma.device)
-        if 'sample_count' in params:
-            self.sample_count = params['sample_count'].to(self.sample_count.device)
+    def set_all_prototypes(self, values: torch.Tensor):
+        """设置所有原型"""
+        self.prototypes.data = values.to(self.prototypes.device)
 
 
-class DualBranchNetwork(nn.Module):
+class FedPCIModel(nn.Module):
     """
-    单个类的双分支网络
+    FedPCI 模型 (重构版)
     
-    包含：
-    - g_common: 共性分支，学习"类之所以为类"的本质特征
-    - g_ind: 个性化分支，学习"样本相对于原型的偏移"
-    - prototype: 类原型 (μ, σ)
+    架构：
+    - g_common: 共性分支，提取共享特征
+    - g_ind: 个性化分支，提取个性化特征
+    - classifier_common: 共性分类头 (聚合)
+    - classifier_full: 完整分类头 (不聚合)
+    - prototypes: 可学习原型
+    
+    聚合策略：
+    - g_common: ✅ 聚合
+    - g_ind: ❌ 不聚合
+    - classifier_common: ✅ 聚合
+    - classifier_full: ❌ 不聚合
+    - prototypes: ✅ 选择性聚合
     """
     
     def __init__(
         self,
-        class_id: int,
+        num_classes: int = 10,
         input_dim: int = 512,
         hidden_dim: int = 256,
         output_dim: int = 128,
         num_layers: int = 3,
-        dropout: float = 0.1,
-        sigma_min: float = 0.1,
-        sigma_max: float = 2.0,
-        num_classes: int = 10
+        dropout: float = 0.1
     ):
         super().__init__()
         
-        self.class_id = class_id
+        self.num_classes = num_classes
         self.input_dim = input_dim
         self.output_dim = output_dim
         
@@ -211,311 +182,189 @@ class DualBranchNetwork(nn.Module):
             dropout=dropout
         )
         
-        # 类原型
-        self.prototype = ClassPrototype(
-            class_id=class_id,
-            dim=output_dim,
-            sigma_min=sigma_min,
-            sigma_max=sigma_max
-        )
+        # 共性分类头 (聚合)
+        self.classifier_common = nn.Linear(output_dim, num_classes)
+        
+        # 完整分类头 (不聚合)
+        self.classifier_full = nn.Linear(output_dim, num_classes)
+        
+        # 可学习原型
+        self.prototypes = LearnablePrototypes(num_classes, output_dim)
+        
+        self._init_classifiers()
+    
+    def _init_classifiers(self):
+        nn.init.xavier_uniform_(self.classifier_common.weight)
+        nn.init.zeros_(self.classifier_common.bias)
+        nn.init.xavier_uniform_(self.classifier_full.weight)
+        nn.init.zeros_(self.classifier_full.bias)
     
     def forward(
         self, 
-        x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x: torch.Tensor,
+        return_features: bool = False
+    ) -> Dict[str, torch.Tensor]:
         """
         前向传播
         
         Args:
             x: backbone特征 [B, input_dim]
+            return_features: 是否返回中间特征
         
         Returns:
-            z_common: 共性特征 [B, output_dim]
-            z_ind: 个性化特征 [B, output_dim]
+            dict containing:
+                - logits_common: [B, num_classes]
+                - logits_full: [B, num_classes]
+                - z_common: [B, output_dim] (if return_features)
+                - z_ind: [B, output_dim] (if return_features)
+                - z_full: [B, output_dim] (if return_features)
         """
-        z_common,commond_result = self.g_common(x)
-        z_ind,ind_result = self.g_ind(x,commond=z_common)
-        return z_common, z_ind, commond_result, ind_result
+        # 共性特征
+        z_common = self.g_common(x)
+        
+        # 个性化特征
+        z_ind = self.g_ind(x)
+        
+        # 完整特征 (残差连接)
+        z_full = z_common + z_ind
+        
+        # 分类
+        logits_common = self.classifier_common(z_common)
+        logits_full = self.classifier_full(z_full)
+        
+        result = {
+            'logits_common': logits_common,
+            'logits_full': logits_full
+        }
+        
+        if return_features:
+            result.update({
+                'z_common': z_common,
+                'z_ind': z_ind,
+                'z_full': z_full
+            })
+        
+        return result
     
-    def compute_distance(
-        self, 
-        x: torch.Tensor, 
-        lambda_ind: float = 0.5
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        计算样本与该类的距离
-        
-        Args:
-            x: backbone特征 [B, input_dim]
-            lambda_ind: 个性化距离的权重
-        
-        Returns:
-            d_total: 总距离 [B]
-            d_common: 共性距离 [B]
-            d_ind: 个性化距离 [B]
-        """
-        z_common, z_ind, commond_result, ind_result = self.forward(x)
-        
-        # 共性距离：||z_common - μ||²
-        d_common = torch.sum((z_common - self.prototype.mean.unsqueeze(0)) ** 2, dim=-1)
-        
-        # 个性化距离：||z_ind / σ||²
-        sigma = self.prototype.sigma.unsqueeze(0)  # [1, d]
-        d_ind = torch.sum((z_ind / sigma) ** 2, dim=-1)
-        
-        # 总距离
-        d_total = d_common + lambda_ind * d_ind
-        
-        return d_total, d_common, d_ind, commond_result, ind_result
+    def get_prototypes(self, class_ids: Optional[List[int]] = None) -> torch.Tensor:
+        """获取原型"""
+        return self.prototypes(class_ids)
     
-    def get_common_params(self) -> Dict[str, torch.Tensor]:
+    # ============ 参数获取方法 (用于聚合) ============
+    
+    def get_common_branch_params(self) -> Dict[str, torch.Tensor]:
         """获取共性分支参数"""
-        return {name: param.data.clone() for name, param in self.g_common.named_parameters()}
+        return {k: v.cpu().clone() for k, v in self.g_common.state_dict().items()}
     
-    def set_common_params(self, params: Dict[str, torch.Tensor]):
+    def set_common_branch_params(self, params: Dict[str, torch.Tensor]):
         """设置共性分支参数"""
-        state_dict = self.g_common.state_dict()
-        for name, value in params.items():
-            if name in state_dict:
-                state_dict[name] = value.to(next(self.g_common.parameters()).device)
+        device = next(self.g_common.parameters()).device
+        state_dict = {k: v.to(device) for k, v in params.items()}
         self.g_common.load_state_dict(state_dict)
     
-    def get_ind_params(self) -> Dict[str, torch.Tensor]:
+    def get_ind_branch_params(self) -> Dict[str, torch.Tensor]:
         """获取个性化分支参数"""
-        return {name: param.data.clone() for name, param in self.g_ind.named_parameters()}
+        return {k: v.cpu().clone() for k, v in self.g_ind.state_dict().items()}
     
-    def set_ind_params(self, params: Dict[str, torch.Tensor]):
+    def set_ind_branch_params(self, params: Dict[str, torch.Tensor]):
         """设置个性化分支参数"""
-        state_dict = self.g_ind.state_dict()
-        for name, value in params.items():
-            if name in state_dict:
-                state_dict[name] = value.to(next(self.g_ind.parameters()).device)
+        device = next(self.g_ind.parameters()).device
+        state_dict = {k: v.to(device) for k, v in params.items()}
         self.g_ind.load_state_dict(state_dict)
     
-    def get_prototype_params(self) -> Dict[str, torch.Tensor]:
+    def get_classifier_common_params(self) -> Dict[str, torch.Tensor]:
+        """获取共性分类头参数"""
+        return {
+            'weight': self.classifier_common.weight.cpu().clone(),
+            'bias': self.classifier_common.bias.cpu().clone()
+        }
+    
+    def set_classifier_common_params(self, params: Dict[str, torch.Tensor]):
+        """设置共性分类头参数"""
+        device = self.classifier_common.weight.device
+        self.classifier_common.weight.data = params['weight'].to(device)
+        self.classifier_common.bias.data = params['bias'].to(device)
+    
+    def get_classifier_full_params(self) -> Dict[str, torch.Tensor]:
+        """获取完整分类头参数"""
+        return {
+            'weight': self.classifier_full.weight.cpu().clone(),
+            'bias': self.classifier_full.bias.cpu().clone()
+        }
+    
+    def set_classifier_full_params(self, params: Dict[str, torch.Tensor]):
+        """设置完整分类头参数"""
+        device = self.classifier_full.weight.device
+        self.classifier_full.weight.data = params['weight'].to(device)
+        self.classifier_full.bias.data = params['bias'].to(device)
+    
+    def get_prototype_params(self) -> torch.Tensor:
         """获取原型参数"""
-        return self.prototype.get_params()
+        return self.prototypes.prototypes.cpu().clone()
     
-    def set_prototype_params(self, params: Dict[str, torch.Tensor]):
+    def set_prototype_params(self, params: torch.Tensor):
         """设置原型参数"""
-        self.prototype.set_params(params)
+        self.prototypes.set_all_prototypes(params)
+    
+    def get_prototype_for_class(self, class_id: int) -> torch.Tensor:
+        """获取单个类别的原型"""
+        return self.prototypes.get_prototype(class_id).cpu().clone()
+    
+    def set_prototype_for_class(self, class_id: int, value: torch.Tensor):
+        """设置单个类别的原型"""
+        self.prototypes.set_prototype(class_id, value)
+    
+    # ============ 聚合相关的便捷方法 ============
+    
+    def get_aggregatable_params(self) -> Dict[str, any]:
+        """
+        获取所有需要聚合的参数
+        
+        Returns:
+            dict containing:
+                - g_common: 共性分支参数
+                - classifier_common: 共性分类头参数
+                - prototypes: 原型参数
+        """
+        return {
+            'g_common': self.get_common_branch_params(),
+            'classifier_common': self.get_classifier_common_params(),
+            'prototypes': self.get_prototype_params()
+        }
+    
+    def set_aggregatable_params(self, params: Dict[str, any]):
+        """设置所有聚合参数"""
+        if 'g_common' in params:
+            self.set_common_branch_params(params['g_common'])
+        if 'classifier_common' in params:
+            self.set_classifier_common_params(params['classifier_common'])
+        if 'prototypes' in params:
+            self.set_prototype_params(params['prototypes'])
+    
+    def get_local_params(self) -> Dict[str, any]:
+        """
+        获取本地参数 (不聚合)
+        
+        Returns:
+            dict containing:
+                - g_ind: 个性化分支参数
+                - classifier_full: 完整分类头参数
+        """
+        return {
+            'g_ind': self.get_ind_branch_params(),
+            'classifier_full': self.get_classifier_full_params()
+        }
+    
+    def set_local_params(self, params: Dict[str, any]):
+        """设置本地参数"""
+        if 'g_ind' in params:
+            self.set_ind_branch_params(params['g_ind'])
+        if 'classifier_full' in params:
+            self.set_classifier_full_params(params['classifier_full'])
 
 
-class FedPCIModel(nn.Module):
-    """
-    FedPCI 完整模型
-    
-    管理所有类的双分支网络
-    
-    架构：
-    - 10个类，每个类有独立的双分支网络
-    - 每个类有独立的原型 (μ, σ)
-    
-    聚合规则：
-    - g_common[c]: 选择性聚合（仅拥有类c的客户端参与）
-    - g_ind[c]: 不聚合（完全本地）
-    - prototype[c]: 选择性聚合
-    """
-    
-    def __init__(
-        self,
-        num_classes: int = 10,
-        input_dim: int = 512,
-        hidden_dim: int = 256,
-        output_dim: int = 128,
-        num_layers: int = 3,
-        dropout: float = 0.1,
-        sigma_min: float = 0.1,
-        sigma_max: float = 2.0,
-        lambda_ind: float = 0.5,
-        temperature: float = 0.1
-    ):
-        super().__init__()
-        
-        self.num_classes = num_classes
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.lambda_ind = lambda_ind
-        self.temperature = temperature
-        
-        # 创建每个类的双分支网络
-        self.class_networks = nn.ModuleDict({
-            str(c): DualBranchNetwork(
-                class_id=c,
-                input_dim=input_dim,
-                hidden_dim=hidden_dim,
-                output_dim=output_dim,
-                num_layers=num_layers,
-                dropout=dropout,
-                sigma_min=sigma_min,
-                sigma_max=sigma_max
-            )
-            for c in range(num_classes)
-        })
-    
-    def get_class_network(self, class_id: int) -> DualBranchNetwork:
-        """获取指定类的网络"""
-        return self.class_networks[str(class_id)]
-    
-    def forward(
-        self, 
-        x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        计算与所有类的距离
-        
-        Args:
-            x: backbone特征 [B, input_dim]
-        
-        Returns:
-            d_total: 总距离矩阵 [B, num_classes]
-            d_common: 共性距离矩阵 [B, num_classes]
-            d_ind: 个性化距离矩阵 [B, num_classes]
-        """
-        batch_size = x.size(0)
-        device = x.device
-        
-        d_total_list = []
-        d_common_list = []
-        d_ind_list = []
-        commond_result_list = []
-        ind_result_list = []
-        
-        for c in range(self.num_classes):
-            network = self.get_class_network(c)
-            d_total, d_common, d_ind, commond_result, ind_result = network.compute_distance(x, self.lambda_ind)
-            d_total_list.append(d_total)
-            d_common_list.append(d_common)
-            d_ind_list.append(d_ind)
-            commond_result_list.append(commond_result)
-            ind_result_list.append(ind_result)
-        
-        d_total = torch.stack(d_total_list, dim=-1)  # [B, num_classes]
-        d_common = torch.stack(d_common_list, dim=-1)
-        d_ind = torch.stack(d_ind_list, dim=-1)
-        commond_logits = torch.stack(commond_result_list, dim=-1)
-        ind_logits = torch.stack(ind_result_list, dim=-1)
-        
-        return d_total, d_common, d_ind, commond_logits, ind_logits
-    
-    def predict(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        预测类别
-        
-        Args:
-            x: backbone特征 [B, input_dim]
-        
-        Returns:
-            pred: 预测类别 [B]
-            probs: 类别概率 [B, num_classes]
-        """
-        d_total, _, _ = self.forward(x)
-        
-        # 距离越小越好，转换为logits
-        logits = -d_total / self.temperature
-        probs = F.softmax(logits, dim=-1)
-        pred = torch.argmin(d_total, dim=-1)
-        
-        return pred, probs
-    
-    def compute_logits_common(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        仅用共性距离计算logits
-        
-        Args:
-            x: backbone特征 [B, input_dim]
-        
-        Returns:
-            logits: [B, num_classes]
-        """
-        _, d_common, _ = self.forward(x)
-        return -d_common / self.temperature
-    
-    def compute_logits_full(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        用完整距离计算logits
-        
-        Args:
-            x: backbone特征 [B, input_dim]
-        
-        Returns:
-            logits: [B, num_classes]
-        """
-        d_total, _, _ = self.forward(x)
-        return -d_total / self.temperature
-    
-    def get_features_for_class(
-        self, 
-        x: torch.Tensor, 
-        class_id: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        获取指定类的特征
-        
-        Args:
-            x: backbone特征 [B, input_dim]
-            class_id: 类别ID
-        
-        Returns:
-            z_common: 共性特征 [B, output_dim]
-            z_ind: 个性化特征 [B, output_dim]
-        """
-        network = self.get_class_network(class_id)
-        return network.forward(x)
-    
-    # ============ 参数获取/设置方法（用于联邦聚合）============
-    
-    def get_all_common_params(self) -> Dict[int, Dict[str, torch.Tensor]]:
-        """获取所有类的共性分支参数"""
-        return {c: self.get_class_network(c).get_common_params() 
-                for c in range(self.num_classes)}
-    
-    def get_common_params(self, class_id: int) -> Dict[str, torch.Tensor]:
-        """获取指定类的共性分支参数"""
-        return self.get_class_network(class_id).get_common_params()
-    
-    def set_common_params(self, class_id: int, params: Dict[str, torch.Tensor]):
-        """设置指定类的共性分支参数"""
-        self.get_class_network(class_id).set_common_params(params)
-    
-    def get_all_ind_params(self) -> Dict[int, Dict[str, torch.Tensor]]:
-        """获取所有类的个性化分支参数"""
-        return {c: self.get_class_network(c).get_ind_params() 
-                for c in range(self.num_classes)}
-    
-    def get_ind_params(self, class_id: int) -> Dict[str, torch.Tensor]:
-        """获取指定类的个性化分支参数"""
-        return self.get_class_network(class_id).get_ind_params()
-    
-    def set_ind_params(self, class_id: int, params: Dict[str, torch.Tensor]):
-        """设置指定类的个性化分支参数"""
-        self.get_class_network(class_id).set_ind_params(params)
-    
-    def get_all_prototype_params(self) -> Dict[int, Dict[str, torch.Tensor]]:
-        """获取所有类的原型参数"""
-        return {c: self.get_class_network(c).get_prototype_params() 
-                for c in range(self.num_classes)}
-    
-    def get_prototype_params(self, class_id: int) -> Dict[str, torch.Tensor]:
-        """获取指定类的原型参数"""
-        return self.get_class_network(class_id).get_prototype_params()
-    
-    def set_prototype_params(self, class_id: int, params: Dict[str, torch.Tensor]):
-        """设置指定类的原型参数"""
-        self.get_class_network(class_id).set_prototype_params(params)
-    
-    def get_prototype_mean(self, class_id: int) -> torch.Tensor:
-        """获取指定类的原型均值"""
-        return self.get_class_network(class_id).prototype.mean
-    
-    def get_prototype_sigma(self, class_id: int) -> torch.Tensor:
-        """获取指定类的原型标准差"""
-        return self.get_class_network(class_id).prototype.sigma
-
-
-# 测试
 if __name__ == "__main__":
-    # 创建模型
+    # 测试
     model = FedPCIModel(
         num_classes=10,
         input_dim=512,
@@ -524,34 +373,36 @@ if __name__ == "__main__":
         num_layers=3
     )
     
-    # 测试前向传播
     x = torch.randn(4, 512)
-    d_total, d_common, d_ind = model(x)
+    output = model(x, return_features=True)
     
-    print(f"Input shape: {x.shape}")
-    print(f"d_total shape: {d_total.shape}")
-    print(f"d_common shape: {d_common.shape}")
-    print(f"d_ind shape: {d_ind.shape}")
+    print("Model Architecture Test:")
+    print(f"  Input: {x.shape}")
+    print(f"  logits_common: {output['logits_common'].shape}")
+    print(f"  logits_full: {output['logits_full'].shape}")
+    print(f"  z_common: {output['z_common'].shape}")
+    print(f"  z_ind: {output['z_ind'].shape}")
+    print(f"  z_full: {output['z_full'].shape}")
     
-    # 测试预测
-    pred, probs = model.predict(x)
-    print(f"\nPrediction: {pred}")
-    print(f"Probs shape: {probs.shape}")
-    
-    # 测试参数获取
-    common_params = model.get_common_params(0)
-    print(f"\nCommon params keys: {list(common_params.keys())}")
-    
-    # 统计参数量
+    # 参数统计
     total_params = sum(p.numel() for p in model.parameters())
-    single_network_params = sum(p.numel() for p in model.get_class_network(0).parameters())
-    common_params_count = sum(p.numel() for p in model.get_class_network(0).g_common.parameters())
-    ind_params_count = sum(p.numel() for p in model.get_class_network(0).g_ind.parameters())
-    prototype_params_count = sum(p.numel() for p in model.get_class_network(0).prototype.parameters())
+    g_common_params = sum(p.numel() for p in model.g_common.parameters())
+    g_ind_params = sum(p.numel() for p in model.g_ind.parameters())
+    cls_common_params = sum(p.numel() for p in model.classifier_common.parameters())
+    cls_full_params = sum(p.numel() for p in model.classifier_full.parameters())
+    proto_params = model.prototypes.prototypes.numel()
     
     print(f"\nParameter counts:")
     print(f"  Total: {total_params:,}")
-    print(f"  Single class network: {single_network_params:,}")
-    print(f"    - g_common: {common_params_count:,}")
-    print(f"    - g_ind: {ind_params_count:,}")
-    print(f"    - prototype: {prototype_params_count:,}")
+    print(f"  g_common: {g_common_params:,}")
+    print(f"  g_ind: {g_ind_params:,}")
+    print(f"  classifier_common: {cls_common_params:,}")
+    print(f"  classifier_full: {cls_full_params:,}")
+    print(f"  prototypes: {proto_params:,}")
+    
+    # 测试参数获取
+    agg_params = model.get_aggregatable_params()
+    print(f"\nAggregatable params keys: {list(agg_params.keys())}")
+    
+    local_params = model.get_local_params()
+    print(f"Local params keys: {list(local_params.keys())}")

@@ -1,11 +1,10 @@
 """
-FedPCI 联邦学习客户端
+FedPCI 联邦学习客户端 (重构版)
 
 核心特点：
-- 双分支架构：g_common（共性） + g_ind（个性化）
-- g_common：选择性聚合（仅拥有该类的客户端参与）
-- g_ind：不聚合（完全本地）
-- 原型 (μ, σ)：选择性聚合
+- 双分支架构：g_common (聚合) + g_ind (不聚合)
+- 两个分类头：classifier_common (聚合) + classifier_full (不聚合)
+- 可学习原型：选择性聚合
 """
 
 import torch
@@ -17,13 +16,12 @@ from typing import Dict, List, Optional, Tuple
 import copy
 
 from models.fedpci_model import FedPCIModel
-from models.backbone import create_backbone
 from losses_fedpci import FedPCILoss
 
 
 class FedPCIClient:
     """
-    FedPCI 联邦客户端
+    FedPCI 联邦客户端 (重构版)
     """
     
     def __init__(
@@ -35,20 +33,15 @@ class FedPCIClient:
         device: str = "cuda",
         learning_rate: float = 0.01,
         weight_decay: float = 1e-4,
-        lambda_ind: float = 0.5,
-        temperature: float = 0.1,
         # 损失权重
-        lambda_cls_common: float = 1.0,
-        lambda_cls_full: float = 1.0,
-        lambda_global: float = 0.5,
-        lambda_common: float = 0.3,
-        lambda_sigma: float = 0.01,
-        lambda_proto_align: float = 0.1
+        lambda_local_align: float = 0.5,
+        lambda_global_align: float = 0.3,
+        lambda_proto_contrast: float = 0.5,
+        temperature: float = 0.1
     ):
         self.client_id = client_id
         self.num_classes = num_classes
         self.device = device
-        self.lambda_ind = lambda_ind
         
         # 模型组件
         self.backbone = backbone.to(device)
@@ -59,17 +52,14 @@ class FedPCIClient:
         # 本地数据信息
         self.local_classes: List[int] = []
         
-        # 保存全局原型（用于原型对齐损失）
-        self.global_prototypes: Dict[int, torch.Tensor] = {}
+        # 保存全局原型（用于对齐和对比损失）
+        self.global_prototypes: Optional[torch.Tensor] = None
         
         # 损失函数
         self.criterion = FedPCILoss(
-            lambda_cls_common=lambda_cls_common,
-            lambda_cls_full=lambda_cls_full,
-            lambda_global=lambda_global,
-            lambda_common=lambda_common,
-            lambda_sigma=lambda_sigma,
-            lambda_proto_align=lambda_proto_align,
+            lambda_local_align=lambda_local_align,
+            lambda_global_align=lambda_global_align,
+            lambda_proto_contrast=lambda_proto_contrast,
             temperature=temperature
         )
         
@@ -84,17 +74,10 @@ class FedPCIClient:
     
     def _init_optimizer(self):
         """初始化优化器"""
-        # 只优化本地拥有类别的参数
-        params = []
-        
-        for cls in self.local_classes:
-            network = self.model.get_class_network(cls)
-            # g_common 参与优化（后续会聚合）
-            params.extend(network.g_common.parameters())
-            # g_ind 参与优化（不聚合，完全本地）
-            params.extend(network.g_ind.parameters())
-            # 原型参与优化（后续会聚合）
-            params.extend(network.prototype.parameters())
+        # 聚合的参数：g_common, classifier_common, prototypes
+        # 不聚合的参数：g_ind, classifier_full
+        # 全部参与本地训练
+        params = list(self.model.parameters())
         
         self.optimizer = optim.SGD(
             params,
@@ -103,50 +86,41 @@ class FedPCIClient:
             weight_decay=self.weight_decay
         )
     
-    def extract_prototypes_from_data(self, train_loader: DataLoader):
+    def load_global_params(self, global_params: Dict[str, any]):
         """
-        从本地数据中提取原型均值
+        加载全局参数
         
-        用 backbone 特征的均值初始化 g_common 输出的原型
+        Args:
+            global_params: 包含 g_common, classifier_common, prototypes
         """
-        self.backbone.eval()
-        self.model.eval()
+        self.model.set_aggregatable_params(global_params)
         
-        # 收集每个类的共性特征
-        class_features: Dict[int, List[torch.Tensor]] = {
-            cls: [] for cls in self.local_classes
+        # 保存全局原型副本（用于损失计算）
+        if 'prototypes' in global_params:
+            self.global_prototypes = global_params['prototypes'].clone().to(self.device)
+    
+    def get_update_params(self) -> Dict[str, any]:
+        """
+        获取需要上传的参数更新
+        
+        Returns:
+            dict containing:
+                - g_common: 共性分支参数
+                - classifier_common: 共性分类头参数
+                - prototypes: 本地原型参数
+                - local_classes: 本地拥有的类别
+        """
+        return {
+            'g_common': self.model.get_common_branch_params(),
+            'classifier_common': self.model.get_classifier_common_params(),
+            'prototypes': self.model.get_prototype_params(),
+            'local_classes': self.local_classes.copy()
         }
-        class_counts: Dict[int, int] = {cls: 0 for cls in self.local_classes}
-        
-        with torch.no_grad():
-            for images, labels in train_loader:
-                images = images.to(self.device)
-                features = self.backbone(images)
-                
-                for i, label in enumerate(labels):
-                    cls = label.item()
-                    if cls in class_features:
-                        # 提取该类的共性特征
-                        network = self.model.get_class_network(cls)
-                        z_common,_ = network.g_common(features[i:i+1])
-                        class_features[cls].append(z_common.squeeze(0).cpu())
-                        class_counts[cls] += 1
-        
-        # 计算每个类的原型均值
-        for cls in self.local_classes:
-            if len(class_features[cls]) > 0:
-                feats = torch.stack(class_features[cls], dim=0)
-                prototype_mean = feats.mean(dim=0).to(self.device)
-                
-                # 更新原型
-                network = self.model.get_class_network(cls)
-                network.prototype.update_mean(prototype_mean, class_counts[cls])
     
     def train(
         self,
         train_loader: DataLoader,
-        num_epochs: int = 5,
-        use_global_loss: bool = True
+        num_epochs: int = 5
     ) -> Dict[str, float]:
         """
         本地训练
@@ -154,10 +128,9 @@ class FedPCIClient:
         Args:
             train_loader: 训练数据加载器
             num_epochs: 本地训练轮数
-            use_global_loss: 是否使用全局对比损失
         
         Returns:
-            metrics: 训练指标（包含各项损失）
+            metrics: 训练指标
         """
         self._init_optimizer()
         self.model.train()
@@ -165,10 +138,9 @@ class FedPCIClient:
         total_loss = 0.0
         total_cls_common = 0.0
         total_cls_full = 0.0
-        total_global = 0.0
-        total_common_compact = 0.0
-        total_sigma_reg = 0.0
-        total_proto_align = 0.0
+        total_local_align = 0.0
+        total_global_align = 0.0
+        total_proto_contrast = 0.0
         total_batches = 0
         
         for epoch in range(num_epochs):
@@ -180,57 +152,30 @@ class FedPCIClient:
                 with torch.no_grad():
                     features = self.backbone(images)
                 
-                # 2. 前向传播：计算所有类的距离
-                d_total, d_common, d_ind,comm_logit, ind_logit = self.model(features)
+                # 2. 前向传播
+                output = self.model(features, return_features=True)
                 
-                # 3. 获取目标类的共性特征（用于紧凑损失）
-                batch_size = features.size(0)
-                z_common_target_list = []
-                for i in range(batch_size):
-                    cls = labels[i].item()
-                    network = self.model.get_class_network(cls)
-                    z_common, _, _, _ = network(features[i:i+1])
-                    z_common_target_list.append(z_common.squeeze(0))
-                z_common_target = torch.stack(z_common_target_list, dim=0)
+                # 3. 获取原型
+                local_prototypes = self.model.get_prototypes()  # [num_classes, d]
                 
-                # 4. 收集原型和 log_sigma
-                prototypes = torch.stack([
-                    self.model.get_prototype_mean(c) 
-                    for c in range(self.num_classes)
-                ], dim=0)
+                # 如果没有全局原型，用本地原型代替（第一轮）
+                if self.global_prototypes is None:
+                    global_prototypes = local_prototypes.detach()
+                else:
+                    global_prototypes = self.global_prototypes
                 
-                log_sigmas = [
-                    self.model.get_class_network(c).prototype.log_sigma
-                    for c in self.local_classes  # 只对本地类计算 sigma 正则化
-                ]
-                
-                # 5. 收集本地原型和全局原型（用于对齐损失）
-                local_prototypes = [
-                    self.model.get_prototype_mean(c)
-                    for c in self.local_classes
-                ]
-                global_prototypes = [
-                    self.global_prototypes.get(c, self.model.get_prototype_mean(c))
-                    for c in self.local_classes
-                ]
-                
-                # 6. 计算损失
+                # 4. 计算损失
                 losses = self.criterion(
-                    d_total=d_total,
-                    d_common=d_common,
+                    logits_common=output['logits_common'],
+                    logits_full=output['logits_full'],
                     targets=labels,
-                    z_common_target=z_common_target,
-                    prototypes=prototypes,
-                    log_sigmas=log_sigmas,
-                    local_classes=self.local_classes,
-                    use_global_loss=use_global_loss,
+                    z_common=output['z_common'],
                     local_prototypes=local_prototypes,
                     global_prototypes=global_prototypes,
-                    comm_logits=comm_logit,
-                    ind_logits=ind_logit
+                    local_classes=self.local_classes
                 )
                 
-                # 7. 反向传播
+                # 5. 反向传播
                 self.optimizer.zero_grad()
                 losses['total'].backward()
                 
@@ -238,95 +183,27 @@ class FedPCIClient:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 
+                # 记录损失
                 total_loss += losses['total'].item()
                 total_cls_common += losses['cls_common'].item()
                 total_cls_full += losses['cls_full'].item()
-                total_global += losses['global'].item()
-                total_common_compact += losses['common_compact'].item()
-                total_sigma_reg += losses['sigma_reg'].item()
-                total_proto_align += losses['proto_align'].item()
+                total_local_align += losses['local_align'].item()
+                total_global_align += losses['global_align'].item()
+                total_proto_contrast += losses['proto_contrast'].item()
                 total_batches += 1
         
-        avg_loss = total_loss / max(total_batches, 1)
-        avg_cls_common = total_cls_common / max(total_batches, 1)
-        avg_cls_full = total_cls_full / max(total_batches, 1)
-        avg_global = total_global / max(total_batches, 1)
-        avg_common_compact = total_common_compact / max(total_batches, 1)
-        avg_sigma_reg = total_sigma_reg / max(total_batches, 1)
-        avg_proto_align = total_proto_align / max(total_batches, 1)
-        
-        # 计算训练后本地原型与全局原型的距离
-        proto_distances = {}
-        for c in self.local_classes:
-            local_mu = self.model.get_prototype_mean(c)
-            global_mu = self.global_prototypes.get(c, local_mu)
-            dist = torch.norm(local_mu - global_mu).item()
-            proto_distances[c] = dist
-        
+        # 计算平均损失
+        n = max(total_batches, 1)
         return {
-            'loss': avg_loss,
-            'cls_common_loss': avg_cls_common,
-            'cls_full_loss': avg_cls_full,
-            'global_loss': avg_global,
-            'common_compact_loss': avg_common_compact,
-            'sigma_reg_loss': avg_sigma_reg,
-            'proto_align_loss': avg_proto_align,
+            'loss': total_loss / n,
+            'cls_common_loss': total_cls_common / n,
+            'cls_full_loss': total_cls_full / n,
+            'local_align_loss': total_local_align / n,
+            'global_align_loss': total_global_align / n,
+            'proto_contrast_loss': total_proto_contrast / n,
             'num_epochs': num_epochs,
-            'num_batches': total_batches,
-            'proto_distances': proto_distances  # 各类原型距离
+            'num_batches': total_batches
         }
-    
-    # ============ 参数获取方法（用于上传到服务端）============
-    
-    def get_common_updates(self) -> Dict[int, Dict[str, torch.Tensor]]:
-        """
-        获取共性分支参数更新
-        
-        只返回本地拥有类别的共性分支参数
-        """
-        updates = {}
-        for cls in self.local_classes:
-            updates[cls] = self.model.get_common_params(cls)
-            # 转移到 CPU
-            updates[cls] = {k: v.cpu() for k, v in updates[cls].items()}
-        return updates
-    
-    def get_prototype_updates(self) -> Dict[int, Dict[str, torch.Tensor]]:
-        """
-        获取原型参数更新
-        
-        只返回本地拥有类别的原型参数
-        """
-        updates = {}
-        for cls in self.local_classes:
-            updates[cls] = self.model.get_prototype_params(cls)
-        return updates
-    
-    # ============ 参数加载方法（从服务端下载）============
-    
-    def load_common_params(self, global_common_params: Dict[int, Dict[str, torch.Tensor]]):
-        """
-        加载全局共性分支参数
-        
-        对于所有类都加载（包括本地没有的类）
-        """
-        for cls, params in global_common_params.items():
-            self.model.set_common_params(cls, params)
-    
-    def load_prototype_params(self, global_prototype_params: Dict[int, Dict[str, torch.Tensor]]):
-        """
-        加载全局原型参数
-        
-        对于所有类都加载（包括本地没有的类）
-        同时保存一份副本用于原型对齐损失
-        """
-        for cls, params in global_prototype_params.items():
-            self.model.set_prototype_params(cls, params)
-            # 保存全局原型副本（用于对齐损失）
-            if 'mean' in params:
-                self.global_prototypes[cls] = params['mean'].clone().to(self.device)
-    
-    # ============ 评估方法 ============
     
     def evaluate(
         self,
@@ -338,7 +215,7 @@ class FedPCIClient:
         
         Args:
             test_loader: 测试数据加载器
-            classes_to_eval: 要评估的类别（None表示全部）
+            classes_to_eval: 要评估的类别
         
         Returns:
             metrics: 评估指标
@@ -346,8 +223,8 @@ class FedPCIClient:
         self.backbone.eval()
         self.model.eval()
         
-        total_correct_common = 0  # 仅用共性距离
-        total_correct_full = 0    # 用完整距离
+        total_correct_common = 0
+        total_correct_full = 0
         total_samples = 0
         
         class_correct_common = {}
@@ -362,14 +239,12 @@ class FedPCIClient:
                 # 提取特征
                 features = self.backbone(images)
                 
-                # 计算距离
-                d_total, d_common, d_ind, com_logit, ind_logit = self.model(features)
+                # 前向传播
+                output = self.model(features)
                 
-                # 预测（仅用共性）
-                pred_common = torch.argmin(com_logit, dim=-1)
-                
-                # 预测（完整）
-                pred_full = torch.argmin(ind_logit, dim=-1)
+                # 预测
+                pred_common = torch.argmax(output['logits_common'], dim=-1)
+                pred_full = torch.argmax(output['logits_full'], dim=-1)
                 
                 # 统计
                 for i in range(len(labels)):
@@ -411,13 +286,12 @@ class FedPCIClient:
                 if class_total[cls] > 0 else 0
             )
         
-        # GRPO Gain = Full - Common
-        metrics['grpo_gain'] = metrics['accuracy_full'] - metrics['accuracy_common']
+        # 个性化增益 = Full - Common
+        metrics['personalization_gain'] = metrics['accuracy_full'] - metrics['accuracy_common']
         
         return metrics
 
 
-# 测试
 if __name__ == "__main__":
     from models.backbone import create_backbone
     
@@ -450,8 +324,8 @@ if __name__ == "__main__":
     print(f"Device: {device}")
     
     # 测试参数获取
-    common_updates = client.get_common_updates()
-    print(f"\nCommon updates classes: {list(common_updates.keys())}")
-    
-    prototype_updates = client.get_prototype_updates()
-    print(f"Prototype updates classes: {list(prototype_updates.keys())}")
+    update_params = client.get_update_params()
+    print(f"\nUpdate params keys: {list(update_params.keys())}")
+    print(f"g_common params: {len(update_params['g_common'])} tensors")
+    print(f"classifier_common params: {list(update_params['classifier_common'].keys())}")
+    print(f"prototypes shape: {update_params['prototypes'].shape}")
